@@ -33,6 +33,35 @@ def calculate_euclidean_distance(matrix1, matrix2):
     """
     return np.linalg.norm(matrix1 - matrix2)
 
+def calculate_cosine_similarity(matrix1, matrix2):
+    """
+    计算两个矩阵之间的余弦相似度
+    相似度范围为[-1, 1]，值越大表示越相似
+    
+    参数:
+    - matrix1: 第一个矩阵
+    - matrix2: 第二个矩阵
+    
+    返回:
+    - 余弦相似度值
+    """
+    # 扁平化矩阵
+    vec1 = matrix1.flatten()
+    vec2 = matrix2.flatten()
+    
+    # 归一化处理（L2归一化）
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    
+    # 避免除以零的情况
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    
+    # 计算余弦相似度
+    cosine_similarity = np.dot(vec1, vec2) / (norm1 * norm2)
+    
+    return cosine_similarity
+
 def get_metadata_file_path(variable, date):
     """
     根据要素和日期获取元数据文件路径（只在带_py的文件夹中查找）
