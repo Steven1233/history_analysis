@@ -1,0 +1,6 @@
+proj = ccrs.PlateCarree()
+shp_path = r"E:\case_study\radar_mosaic_plot\shp\Province_9"
+provinces = cfeat.ShapelyFeature(
+    Reader(os.path.join(shp_path, "Province_9.shp")).geometries(),
+    proj, edgecolor="k", facecolor="none",
+)
