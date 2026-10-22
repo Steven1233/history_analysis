@@ -18,13 +18,15 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from . import config as cfgmod
 from .config import ELEMENTS, SearchConfig, builtin_template
 from .datasource import Store, discover_and_register
 from .engine import Cancelled, run_search
+from .precip import DEFAULT_WINDOWS, GROUPS, PRECIP_PRODUCTS, PreprocessCancelled, \
+    run_preprocess, scan_source
 
 # 界面默认展示的排名条数（后端仍按 TopN 全量计算）
 RANK_VIEW_LIMIT = 80
@@ -80,6 +82,38 @@ class TaskState:
         }
 
 
+class PreprocessJob:
+    """一次数据预处理任务的运行态（进度、日志、结果）。"""
+
+    def __init__(self, job_id: str, params: Dict):
+        self.id = job_id
+        self.params = params
+        self.state = "running"            # running | done | failed | cancelled
+        self.stage = "init"
+        self.label = "准备中"
+        self.done = 0
+        self.total = 0
+        self.msg = ""
+        self.log: List[Dict[str, Any]] = []
+        self.error = ""
+        self.result: Optional[Dict] = None
+        self.started_at = time.time()
+        self.finished_at: Optional[float] = None
+        self.cancel = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+
+    def snapshot(self) -> Dict:
+        elapsed = (self.finished_at or time.time()) - self.started_at
+        pct = round(100.0 * self.done / self.total, 1) if self.total else 0.0
+        return {
+            "job_id": self.id, "state": self.state, "stage": self.stage,
+            "label": self.label, "done": self.done, "total": self.total,
+            "pct": pct, "msg": self.msg, "error": self.error,
+            "elapsed_s": round(elapsed, 1), "log": self.log[-40:],
+            "params": self.params, "result": self.result,
+        }
+
+
 class SearchSession:
     """统一门面：数据源管理 → 配置 → 检索 → 结果。"""
 
@@ -88,6 +122,9 @@ class SearchSession:
         self._tasks: Dict[str, TaskState] = {}
         self._lock = threading.Lock()
         self._order: List[str] = []
+        self._jobs: Dict[str, PreprocessJob] = {}
+        self._job_order: List[str] = []
+        self._job_lock = threading.Lock()
 
     # ══ 数据源 ════════════════════════════════════════════════════════
     def sources(self) -> Dict:
@@ -96,6 +133,7 @@ class SearchSession:
             "sources": srcs,
             "n_era5": sum(1 for s in srcs if s["kind"] == "era5"),
             "n_gmcp": sum(1 for s in srcs if s["kind"] == "gmcp"),
+            "n_gmcp_rain": sum(1 for s in srcs if s["kind"] == "gmcp_rain"),
             "n_files": sum(int(c["n_files"]) for s in srcs for c in s["coverage"]),
         }
 
@@ -121,10 +159,14 @@ class SearchSession:
         return {
             "data_dir": self.store.data_dir,
             "counts": {"n_era5": srcs["n_era5"], "n_gmcp": srcs["n_gmcp"],
+                       "n_gmcp_rain": srcs["n_gmcp_rain"],
                        "n_files": srcs["n_files"]},
             "coverage": coverage,
             "elements": [{"key": k, "name": v[2], "units": v[3],
                           "file_element": v[0]} for k, v in ELEMENTS.items()],
+            "precip_windows": [{"key": k, "name": p.label(), "group": p.group,
+                                 "duration_h": p.duration_h}
+                                for k, p in PRECIP_PRODUCTS.items()],
             "years": {"from": years[0] if years else None,
                       "to": years[-1] if years else None, "list": years},
             "disk": disk,
@@ -156,6 +198,10 @@ class SearchSession:
         cfg.similarity_formula = str(cfg.similarity_formula or "").strip()
         cfg.period_days = int(cfg.period_days)
         cfg.plot_direct_fields = bool(cfg.plot_direct_fields)
+        cfg.precip_enabled = bool(cfg.precip_enabled)
+        cfg.precip_windows = [str(k) for k in (cfg.precip_windows or [])]
+        cfg.precip_topn = int(cfg.precip_topn)
+        cfg.precip_thresholds = [float(x) for x in (cfg.precip_thresholds or [])]
         return cfg
 
     # ══ 地图圈选（第 5 项）════════════════════════════════════════════
@@ -183,27 +229,171 @@ class SearchSession:
         errors = cfg.validate()
         if errors:
             return {"ok": False, "errors": errors, "config": cfg.to_dict()}
-        dates = self.store.available_dates(cfg)
+        dates = self.store.available_dates(cfg) if cfg.elements() else []
+        precip_dates = (self.store.available_precip_dates(cfg)
+                        if cfg.precip_active else [])
         # 每个「要素×日期」只需打开一次文件（同文件的多个时次/层次合并读）
         n_files = len(dates) * len(cfg.elements())
         n_gmcp = 0
-        if cfg.enable_24h:
+        if cfg.enable_24h and cfg.elements():
             n_gmcp = max(1, cfg.inter_topn) * len(cfg.rain_window_24h)
+        n_precip_files = len(precip_dates) * len(cfg.precip_windows)
         read = self.store.readiness(cfg)
+        all_dates = dates or precip_dates
         return {
             "ok": True,
             "errors": [],
             "config": cfg.to_dict(),
-            "n_samples": len(dates),
-            "sample_range": ([dates[0].isoformat(), dates[-1].isoformat()]
-                             if dates else None),
+            "n_samples": len(all_dates),
+            "n_era5_samples": len(dates),
+            "n_precip_samples": len(precip_dates),
+            "sample_range": ([all_dates[0].isoformat(), all_dates[-1].isoformat()]
+                             if all_dates else None),
             "n_era5_files": n_files,
             "n_era5_files_per_variable": len(dates),
             "n_gmcp_hours_est": n_gmcp,
+            "n_precip_files": n_precip_files,
+            "n_precip_windows": len(cfg.precip_windows) if cfg.precip_active else 0,
+            "precip_ready": bool(cfg.precip_active and precip_dates),
             "coverage_pct": read["coverage_pct"],
             "ready": read["ready"],
             "n_gaps": len(read["gaps"]),
         }
+
+    # ══ 数据预处理 ════════════════════════════════════════════════════
+    def preprocess_meta(self) -> Dict:
+        """预处理页面所需的静态字典：产品窗口、分组与默认目录。"""
+        return {
+            "ok": True,
+            "products": [{
+                "key": k, "group": p.group, "label": p.label(),
+                "duration_h": p.duration_h, "folder": p.folder,
+                "filename_example": p.filename(date(2000, 6, 1)),
+                "anchor": p.anchor, "hour": p.hour,
+            } for k, p in PRECIP_PRODUCTS.items()],
+            "groups": [{"key": g, "name": {"24h": "24 小时", "12h": "12 小时",
+                                           "6h": "6 小时"}[g],
+                        "keys": keys} for g, keys in GROUPS.items()],
+            "default_windows": list(DEFAULT_WINDOWS),
+            "defaults": {
+                "output_root": os.path.join(self.store.data_dir, "preprocessed"),
+                "year_from": 2000, "year_to": 2024,
+                "groups": list(GROUPS), "overwrite": False,
+            },
+        }
+
+    def preprocess_scan(self, raw: Dict) -> Dict:
+        root = str((raw or {}).get("source_root") or "").strip().strip('"')
+        if not root:
+            raise ValueError("请填写 GMCP 逐小时源目录")
+        if not os.path.isdir(root):
+            raise ValueError(f"源目录不存在或不可访问：{root}")
+        y1 = int((raw or {}).get("year_from") or 2000)
+        y2 = int((raw or {}).get("year_to") or 2024)
+        if y1 > y2:
+            raise ValueError("起始年份不能大于结束年份")
+        return self.preprocess_meta() | scan_source(root, y1, y2)
+
+    def _preprocess_params(self, raw: Dict) -> Dict:
+        raw = dict(raw or {})
+        src = str(raw.get("source_root") or "").strip().strip('"')
+        out = str(raw.get("output_root") or "").strip().strip('"') or \
+            os.path.join(self.store.data_dir, "preprocessed")
+        if not src:
+            raise ValueError("请填写 GMCP 逐小时源目录")
+        if not os.path.isdir(src):
+            raise ValueError(f"源目录不存在或不可访问：{src}")
+        groups = [str(g) for g in (raw.get("groups") or list(GROUPS))]
+        bad = [g for g in groups if g not in GROUPS]
+        if bad:
+            raise ValueError("未知的降水产品分组：" + ", ".join(bad))
+        keys = [k for g in groups for k in GROUPS[g]]
+        y1 = int(raw.get("year_from") or 2000)
+        y2 = int(raw.get("year_to") or 2024)
+        if y1 > y2:
+            raise ValueError("起始年份不能大于结束年份")
+        if not (1900 <= y1 <= 2200 and 1900 <= y2 <= 2200):
+            raise ValueError("年份超出合理范围")
+        return {
+            "source_root": os.path.abspath(src),
+            "output_root": os.path.abspath(out),
+            "groups": groups, "products": keys,
+            "year_from": y1, "year_to": y2,
+            "overwrite": bool(raw.get("overwrite")),
+        }
+
+    def preprocess_start(self, raw: Dict) -> Dict:
+        params = self._preprocess_params(raw)
+        job_id = "prep_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + \
+            uuid.uuid4().hex[:6]
+        st = PreprocessJob(job_id, params)
+        with self._job_lock:
+            self._jobs[job_id] = st
+            self._job_order.append(job_id)
+        st.thread = threading.Thread(target=self._run_preprocess, args=(st,),
+                                     daemon=True, name=f"histsim-{job_id}")
+        st.thread.start()
+        return {"job_id": job_id, "params": params}
+
+    def _run_preprocess(self, st: PreprocessJob) -> None:
+        def report(stage: str, label: str, done: int, total: int, msg: str = "") -> None:
+            if st.stage != stage or st.label != label:
+                st.log.append({"t": round(time.time() - st.started_at, 1),
+                               "stage": stage, "label": label})
+            st.stage, st.label, st.done, st.total, st.msg = stage, label, done, total, msg
+
+        p = st.params
+        try:
+            res = run_preprocess(p["source_root"], p["output_root"], p["products"],
+                                 p["year_from"], p["year_to"],
+                                 overwrite=p["overwrite"], progress=report,
+                                 should_stop=st.cancel.is_set)
+            st.result = res
+            st.state = "done"
+            st.log.append({"t": round(time.time() - st.started_at, 1),
+                           "stage": "done",
+                           "label": f"完成：写出 {res['n_written']} 个产品"})
+            self.store.log("数据预处理", p["output_root"],
+                           f"{p['year_from']}–{p['year_to']} · 写出 {res['n_written']}",
+                           "成功")
+        except PreprocessCancelled:
+            st.state = "cancelled"
+            st.log.append({"t": round(time.time() - st.started_at, 1),
+                           "stage": "cancelled", "label": "已取消"})
+            self.store.log("数据预处理", p["output_root"], "用户取消", "已取消")
+        except Exception as exc:
+            st.state = "failed"
+            st.error = f"{type(exc).__name__}: {exc}"
+            st.log.append({"t": round(time.time() - st.started_at, 1),
+                           "stage": "error", "label": st.error})
+            self.store.log("数据预处理", p["output_root"], st.error, "失败")
+        finally:
+            st.finished_at = time.time()
+
+    def preprocess_progress(self, job_id: str) -> Dict:
+        st = self._jobs.get(job_id)
+        if st is None:
+            raise KeyError(f"未知预处理任务: {job_id}")
+        return st.snapshot()
+
+    def preprocess_cancel(self, job_id: str) -> Dict:
+        st = self._jobs.get(job_id)
+        if st is None:
+            raise KeyError(f"未知预处理任务: {job_id}")
+        st.cancel.set()
+        return {"ok": True, "job_id": job_id}
+
+    def preprocess_register(self, raw: Dict) -> Dict:
+        root = str((raw or {}).get("output_root") or "").strip().strip('"') or \
+            os.path.join(self.store.data_dir, "preprocessed")
+        if not os.path.isdir(root):
+            raise ValueError(f"预处理输出目录不存在：{root}")
+        rep = discover_and_register(self.store, root, depth=1)
+        return {"ok": True, **rep, "sources": self.sources()}
+
+    def preprocess_jobs(self) -> List[Dict]:
+        with self._job_lock:
+            return [self._jobs[j].snapshot() for j in self._job_order[-20:]]
 
     # ══ 检索 ══════════════════════════════════════════════════════════
     def start(self, raw: Optional[Dict]) -> Dict:
@@ -242,9 +432,13 @@ class SearchSession:
             st.state = "done"
             st.log.append({"t": round(time.time() - st.started_at, 1), "stage": "done",
                            "label": f"完成，耗时 {res['elapsed_s']}s"})
-            self.store.record_task(st.cfg, "成功", res["elapsed_s"], st.out_dir,
-                                   f"样本 {res['samples']['n_used']} · "
-                                   f"入组 {res['combine'][str(st.cfg.times[0])]['n_final']} 个相似时刻")
+            n_final = ((res.get("combine") or {}).get(str(st.cfg.times[0]), {})
+                       .get("n_final", 0))
+            n_precip = len((res.get("precip") or {}).get("windows") or {})
+            summary = f"样本 {res['samples']['n_used']} · 入组 {n_final} 个相似时刻"
+            if n_precip:
+                summary += f" · 累计降水窗口 {n_precip} 个"
+            self.store.record_task(st.cfg, "成功", res["elapsed_s"], st.out_dir, summary)
             self.store.log("相似检索", st.cfg.target_date, st.cfg.name,
                            f"完成 {res['elapsed_s']}s")
         except Cancelled:
@@ -317,6 +511,8 @@ class SearchSession:
     def close(self) -> None:
         for st in self._tasks.values():
             st.cancel.set()
+        for st in self._jobs.values():
+            st.cancel.set()
         try:
             self.store.close()
         except Exception:
@@ -337,12 +533,22 @@ def _result_view(st: TaskState, res: Dict) -> Dict:
                for name, path in res["figures"].items() if not name.startswith("error")}
     fig_errors = {name: msg for name, msg in res["figures"].items()
                   if name.startswith("error")}
+    src_precip = res.get("precip") or {}
+    precip_windows = {}
+    for key, win in (src_precip.get("windows") or {}).items():
+        w = {k: v for k, v in win.items() if k != "products"}
+        prod = dict(win.get("products") or {})
+        prod.pop("spatial", None)
+        w["products"] = prod
+        w["spatial_ready"] = bool((win.get("products") or {}).get("spatial"))
+        precip_windows[key] = w
+    grid = res.get("grid") or res.get("gmcp_grid") or {}
     return {
         "task_id": st.id,
         "target_date": res["target_date"],
         "config": res["config"],
-        "grid": res["grid"],
-        "gmcp_grid": res["gmcp_grid"],
+        "grid": grid,
+        "gmcp_grid": res["gmcp_grid"] or grid,
         "samples": res["samples"],
         "times": res["times"],
         "ranking": ranking,
@@ -352,6 +558,17 @@ def _result_view(st: TaskState, res: Dict) -> Dict:
                      "point": res["products"]["point"]},
         "rain_meta": {"n_hours_read": res["products"].get("n_hours_read"),
                       "n_moments": res["products"].get("n_moments")},
+        "precip": {
+            "enabled": bool(src_precip.get("enabled")),
+            "available": bool(src_precip.get("available")),
+            "reason": src_precip.get("reason", ""),
+            "skipped": src_precip.get("skipped") or [],
+            "n_candidates": src_precip.get("n_candidates", 0),
+            "point": src_precip.get("point") or [],
+            "thresholds": src_precip.get("thresholds") or [],
+            "grid": src_precip.get("grid") or {},
+            "windows": precip_windows,
+        },
         "figures": figures,
         "figure_errors": fig_errors,
         "timings": res["timings"],
@@ -393,6 +610,20 @@ def _self_check() -> None:
     assert cfg3.sample_mode == "same_period" and cfg3.period_days == 7
     assert cfg3.feature_process == "normalize" and cfg3.similarity == "custom"
     assert cfg3.similarity_formula == "sqrt(sum(w*d*d))" and cfg3.plot_direct_fields
+    # V2.1.0：预处理元数据与累计降水配置
+    pm = s.preprocess_meta()
+    assert len(pm["products"]) == 8 and {g["key"] for g in pm["groups"]} == \
+        {"24h", "12h", "6h"}, pm
+    cfg4 = s.resolve_config({"template": "plan_A", "precip_enabled": False,
+                             "precip_windows": [], "precip_topn": 12,
+                             "precip_thresholds": [0.1, 30]})
+    assert cfg4.precip_enabled is False and cfg4.precip_windows == []
+    assert cfg4.precip_topn == 12 and cfg4.precip_thresholds == [0.1, 30.0]
+    # 仅累计降水检索：不勾选 ERA5 要素也应通过校验
+    only = s.resolve_config({"template": "plan_A", "variables": [],
+                             "inter_group": [], "direct_group": [],
+                             "target_date": "2024-06-01"})
+    assert not only.validate(), only.validate()
     # 圈选底图接口（第 5 项）：范围与像素尺寸必须与 viz 的常量一致
     b = s.region_bounds()
     assert b["width"] == 1000 and b["height"] > 0 and len(b["view"]) == 4

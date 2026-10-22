@@ -591,6 +591,83 @@ def render_spatial(cfg: SearchConfig, products: Dict, glat: np.ndarray,
     return _save(fig, os.path.join(out_dir, f"spatial_{tag}.png"))
 
 
+# ── GMCP 累计降水目标检索产品图 ────────────────────────────────────────
+def render_precip_product(cfg: SearchConfig, win: Dict, glat: np.ndarray,
+                          glon: np.ndarray, out_dir: str) -> Optional[str]:
+    """单个累计降水窗口的产品图：平均场、中位数场、各阈值概率场。"""
+    prod = win.get("products") or {}
+    spatial = prod.get("spatial") or {}
+    mean = spatial.get("mean")
+    median = spatial.get("median")
+    if mean is None:
+        return None
+    ths = [float(t) for t in (win.get("thresholds") or []) if f"prob_{t}" in spatial]
+    panels = [("mean", None), ("median", None)] + [(f"prob_{t}", t) for t in ths]
+    n = len(panels)
+    ncol = min(3, n)
+    nrow = int(math.ceil(n / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(6.2 * ncol, 5.0 * nrow),
+                             squeeze=False)
+    fig.patch.set_facecolor(PAPER)
+    extent = _cell_extent(glon, glat)
+    view = basemap_view(extent, 8.0)
+    levels = np.linspace(0, 1, 11)
+    label = win.get("label") or win.get("key", "")
+    for i, (key, th) in enumerate(panels):
+        ax = axes[i // ncol][i % ncol]
+        if key in ("mean", "median"):
+            field = mean if key == "mean" else median
+            im = ax.pcolormesh(glon, glat, field, cmap=SPATIAL_CMAP_MEAN,
+                               shading="auto")
+            title = f"相似日累计降水{'平均' if key == 'mean' else '中位数'} (mm)"
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02).ax.tick_params(labelsize=7)
+        else:
+            field_p = spatial.get(key)
+            cmap_p = SPATIAL_CMAP_PROB_STRONG if th >= 30 else SPATIAL_CMAP_PROB_LOW
+            im = ax.pcolormesh(glon, glat, field_p, cmap=cmap_p, shading="auto",
+                               norm=BoundaryNorm(levels, 256))
+            cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02, ticks=levels)
+            cb.ax.set_yticklabels([f"{int(l * 100)}%" for l in levels], fontsize=7)
+            title = f"累计降水 ≥ {th:g}mm 概率"
+        _paper_axes(ax, f"{title}\n{label} · n={prod.get('n_valid', 0)}")
+        _mark_extent(ax, extent, label="检索数据区" if i == 0 else None)
+        add_admin_layers(ax, view)
+        ax.set_xlim(view[0], view[1])
+        ax.set_ylim(view[2], view[3])
+        ax.set_aspect(_geo_aspect(view))
+        ax.set_xlabel("经度 (°E)", fontsize=9)
+        ax.set_ylabel("纬度 (°N)", fontsize=9)
+    for i in range(n, nrow * ncol):   # 多余面板隐藏
+        axes[i // ncol][i % ncol].set_visible(False)
+    fig.suptitle(f"GMCP 累计降水相似产品 · {cfg.name} · 目标 {cfg.target_date}",
+                 fontsize=12, color=INK)
+    fig.text(0.5, 0.005,
+             f"由 {prod.get('n_valid', 0)} 个相似历史日的累计降水场统计；"
+             "窗口：" + label,
+             ha="center", fontsize=8, color="#4A5058")
+    return _save(fig, os.path.join(out_dir, f"precip_{win.get('key', 'window')}.png"))
+
+
+def render_precip_all(cfg: SearchConfig, precip: Dict, glat: np.ndarray,
+                      glon: np.ndarray, out_dir: str,
+                      progress=None) -> Dict[str, str]:
+    windows = (precip or {}).get("windows") or {}
+    out: Dict[str, str] = {}
+    total = len(windows)
+    for i, (key, win) in enumerate(windows.items(), 1):
+        if progress:
+            progress("figures", "生成图表", i - 1, total, f"累计降水产品图 · {key}")
+        try:
+            p = render_precip_product(cfg, win, glat, glon, out_dir)
+            if p:
+                out[f"precip_{key}"] = p
+        except Exception as exc:  # 单图失败不应中断整轮检索
+            out[f"error_precip_{key}"] = f"{type(exc).__name__}: {exc}"
+    if progress:
+        progress("figures", "生成图表", total, total, "完成")
+    return out
+
+
 # ── 统一入口 ──────────────────────────────────────────────────────────
 def render_all(cfg: SearchConfig, grid, glat, glon, fields, read_dates, target_i,
                ranking: Dict, combine: Dict, products: Dict, out_dir: str,

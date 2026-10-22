@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta
 from typing import Dict, Iterable, Iterator, List, Optional
 
 from .config import ELEMENTS, SearchConfig, split_key, var_key
+from .precip import PRECIP_PRODUCTS, match_filename, product_path
 
 ERA5_RE = re.compile(r"^era5\.([a-z_]+)\.(\d{8})\.nc$", re.I)
 GMCP_RE = re.compile(r"^GMCP_(\d{4})_(\d{2})_(\d{2})_(\d{2})\.nc$", re.I)
@@ -248,6 +249,25 @@ class Store:
         ).fetchall()
         return [r["root"] for r in rows]
 
+    @_locked
+    def precip_roots(self, product_key: str) -> List[str]:
+        """累计降水产品的登记目录（kind='gmcp_rain'，element=产品 key）。"""
+        rows = self.conn.execute(
+            "SELECT root FROM data_sources WHERE kind='gmcp_rain' AND element=? "
+            "ORDER BY id", (product_key,)
+        ).fetchall()
+        return [r["root"] for r in rows]
+
+    def find_precip(self, product_key: str, day: date) -> Optional[str]:
+        if product_key not in PRECIP_PRODUCTS:
+            return None
+        name = PRECIP_PRODUCTS[product_key].filename(day)
+        for root in self.precip_roots(product_key):
+            p = os.path.join(root, name)
+            if os.path.isfile(p):
+                return p
+        return None
+
     def find_era5(self, element: str, day: date) -> Optional[str]:
         """同要素可登记多个目录，按登记顺序取第一个命中的。"""
         name = f"era5.{ELEMENTS[element][0]}.{day:%Y%m%d}.nc"
@@ -283,7 +303,7 @@ class Store:
     def coverage_grid(self) -> Dict:
         """看板用：要素 -> {year: {month: {'n':可用文件数, 'pct':占该月天数比例}}}"""
         grid = {}
-        for element in ELEMENTS:
+        for element in list(ELEMENTS) + list(PRECIP_PRODUCTS):
             cov = self.coverage_of(element)
             if not cov:
                 continue
@@ -298,6 +318,19 @@ class Store:
                 for y, ms in sorted(cov.items())
             }
         return grid
+
+    def available_precip_dates(self, cfg: SearchConfig,
+                               keys: Optional[List[str]] = None) -> List[date]:
+        """列出所选累计降水产品全部齐备的日期（取样方式与 ERA5 一致）。"""
+        keys = [k for k in (keys if keys is not None else cfg.precip_windows)
+                if k in PRECIP_PRODUCTS]
+        if not keys:
+            return []
+        out = []
+        for day in _expected_dates(cfg):
+            if all(self.find_precip(k, day) for k in keys):
+                out.append(day)
+        return out
 
     def available_dates(self, cfg: SearchConfig) -> List[date]:
         """列出配置所需全部要素都齐备的日期。"""
@@ -350,6 +383,37 @@ class Store:
                                 "have": have,
                                 "expect": expect,
                             })
+        # ── GMCP 累计降水产品（kind=gmcp_rain）──────────────────────────
+        precip_keys = ([k for k in cfg.precip_windows if k in PRECIP_PRODUCTS]
+                       if getattr(cfg, "precip_active", False) else [])
+        if precip_keys and cfg.sample_mode == "same_period":
+            buckets: Dict[tuple, List[int]] = {}
+            for key in precip_keys:
+                for day in _expected_dates(cfg):
+                    b = buckets.setdefault((key, day.year, day.month), [0, 0])
+                    b[0] += 1
+                    if self.find_precip(key, day):
+                        b[1] += 1
+            for (key, year, month), (expect, have) in sorted(buckets.items()):
+                total += expect
+                avail += have
+                if have < expect:
+                    gaps.append({"element": key, "year": year, "month": month,
+                                 "have": have, "expect": expect})
+        elif precip_keys:
+            for key in precip_keys:
+                cov = self.coverage_of(key)
+                for year in range(cfg.year_from, cfg.year_to + 1):
+                    for month in sorted(set(cfg.months)):
+                        if not 1 <= month <= 12:
+                            continue
+                        expect = calendar.monthrange(year, month)[1]
+                        have = cov.get(year, {}).get(month, 0)
+                        total += expect
+                        avail += min(expect, have)
+                        if have < expect:
+                            gaps.append({"element": key, "year": year, "month": month,
+                                         "have": have, "expect": expect})
         ratio = round(avail / total, 3) if total else 0.0
         return {
             "ready": not gaps,
@@ -442,7 +506,34 @@ def probe_directory(path: str, sample_read: bool = True) -> Dict:
             res["sample"] = _verify_era5(path, era5_files[res["elements"][0]["file_element"]][0])
         return res
 
-    # GMCP：<root>/<yyyy>/GMCP_*.nc
+    # GMCP 累计降水预处理产物：GMCP_24h_Rain_*.nc / GMCP_12h_Rain_*.nc / GMCP_6h_Rain_*.nc
+    precip_files: Dict[str, List[str]] = {}
+    for n in names:
+        hit = match_filename(n)
+        if hit:
+            precip_files.setdefault(hit[0], []).append(n)
+    if precip_files:
+        res["kind"] = "gmcp_rain"
+        for key, files in sorted(precip_files.items()):
+            cov: Dict[int, Dict[int, int]] = {}
+            for f in files:
+                hit = match_filename(f)
+                if not hit:
+                    continue
+                d = hit[1]
+                cov.setdefault(d.year, {})[d.month] = \
+                    cov.setdefault(d.year, {}).get(d.month, 0) + 1
+            res["elements"].append({"key": key, "file_element": "rain",
+                                    "n_files": len(files)})
+            res["coverage"][key] = cov
+        res["ok"] = bool(res["elements"])
+        if sample_read and res["elements"]:
+            first = res["elements"][0]
+            res["sample"] = _verify_precip(
+                os.path.join(path, sorted(precip_files[first["key"]])[0]))
+        return res
+
+    # GMCP 逐小时源数据：<root>/<yyyy>/GMCP_*.nc
     cov_g: Dict[int, Dict[int, int]] = {}
     n_files = 0
     for sub in sorted(subdirs):
@@ -533,6 +624,31 @@ def _verify_gmcp(p: str) -> Dict:
                               float(ds.variables["lon"][:].max())],
                 "description": getattr(ds, "description", ""),
             }
+    except Exception as exc:
+        return {"file": os.path.basename(p), "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _verify_precip(p: str) -> Dict:
+    """抽样打开一个累计降水产品，核对变量与网格。"""
+    from netCDF4 import Dataset
+    try:
+        with Dataset(p) as ds:
+            var = "rain" if "rain" in ds.variables else (
+                "rain_rate" if "rain_rate" in ds.variables else None)
+            out = {
+                "file": os.path.basename(p),
+                "var": var,
+                "var_present": var is not None,
+                "dims": {k: v.size for k, v in ds.dimensions.items()},
+                "description": getattr(ds, "description", ""),
+                "product": getattr(ds, "product", ""),
+                "duration_h": int(getattr(ds, "duration_h", 0) or 0),
+            }
+            for name in ("lat", "lon"):
+                if name in ds.variables:
+                    vals = ds.variables[name][:]
+                    out[f"{name}_range"] = [float(vals.min()), float(vals.max())]
+            return out
     except Exception as exc:
         return {"file": os.path.basename(p), "error": f"{type(exc).__name__}: {exc}"}
 

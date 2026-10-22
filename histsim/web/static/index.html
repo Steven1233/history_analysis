@@ -28,6 +28,7 @@
     <nav class="nav" id="nav">
       <button class="nav-item" data-view="dashboard"><i>◧</i><span>数据看板</span></button>
       <button class="nav-item" data-view="sources"><i>▤</i><span>数据源</span></button>
+      <button class="nav-item" data-view="preprocess"><i>⛭</i><span>数据预处理</span></button>
       <button class="nav-item" data-view="config"><i>⚙</i><span>检索配置</span></button>
       <button class="nav-item" data-view="run"><i>▶</i><span>执行进程</span><em id="runDot" class="dot"></em></button>
       <button class="nav-item" data-view="result"><i>◈</i><span>结果产品</span></button>
@@ -111,7 +112,60 @@
         </div>
       </section>
 
-      <!-- ══ 3 检索配置 ══ -->
+      <!-- ══ 3 数据预处理 ══ -->
+      <section class="view" id="view-preprocess">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>GMCP 累计降水预处理</h3>
+            <p>把 GMCP 世界时逐小时降水累加为北京时间 24/12/6 小时产品。窗口与命名按业务约定，
+              产物目录可一键登记为检索数据源；框架按“产品定义表 + 通用执行器”组织，后续新增累计窗口只需扩展定义。</p>
+          </div>
+          <div class="form-grid">
+            <label class="field span2"><span>GMCP 逐小时源目录（含 &lt;yyyy&gt;/GMCP_*.nc）</span>
+              <input id="prepSrc" type="text" placeholder="例如 I:\GMCP" spellcheck="false"></label>
+            <label class="field span2"><span>预处理输出目录</span>
+              <input id="prepOut" type="text" spellcheck="false"></label>
+            <label class="field"><span>起始年份</span><input id="prepYFrom" type="number" step="1"></label>
+            <label class="field"><span>结束年份</span><input id="prepYTo" type="number" step="1"></label>
+          </div>
+          <div class="chipset-block">
+            <label class="chipset-label">产品分组</label>
+            <div class="chipset" id="prepGroups"></div>
+          </div>
+          <div class="form-grid">
+            <label class="field checkbox span2"><label><input id="prepOverwrite" type="checkbox">覆盖已有产品文件（默认跳过已存在的日期）</label></label>
+          </div>
+          <div class="row-btns">
+            <button class="btn" id="btnPrepScan">扫描源数据</button>
+            <button class="btn primary" id="btnPrepStart">开始预处理</button>
+            <button class="btn danger" id="btnPrepCancel" disabled>取消任务</button>
+          </div>
+          <div class="hint" id="prepScanHint">窗口说明：24h 两套（前一日20时→当日20时、当日08时→次日08时）；
+            12h 两段（20→08、08→20）；6h 四段（20→02、02→08、08→14、14→20），均为北京时间。</div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h3>预处理进度 <em id="prepJobId" class="pill-num">—</em></h3>
+            <p id="prepHeadNote">尚未启动预处理任务。</p></div>
+          <div class="progress-wrap">
+            <div class="progress"><div class="progress-bar" id="prepBar"></div></div>
+            <div class="progress-meta">
+              <span id="prepPct">0%</span><span id="prepMsg"></span><span id="prepElapsed"></span>
+            </div>
+          </div>
+          <div class="console" id="prepLog"></div>
+        </div>
+
+        <div class="panel" id="prepResult" hidden></div>
+
+        <div class="actionbar">
+          <button class="btn primary" id="btnPrepRegister" disabled>登记预处理产物</button>
+          <button class="btn" data-next="config">下一步：检索配置 →</button>
+          <span class="actionbar-note" id="prepNote"></span>
+        </div>
+      </section>
+
+      <!-- ══ 4 检索配置 ══ -->
       <section class="view" id="view-config">
         <div class="grid2">
           <div class="panel">
@@ -163,6 +217,26 @@
               <button class="btn tiny" id="btnRegionSync">从配置回填</button>
               <button class="btn tiny" id="btnRegionClear">清除圈选</button>
             </div>
+          </div>
+
+          <div class="panel span2">
+            <div class="panel-head"><h3>GMCP 累计降水目标检索（第一优先）</h3>
+              <p>直接以预处理后的北京时间累计降水场作为目标变量检索相似历史日，并统计平均/中位数/阈值概率产品。
+                每个窗口独立取 TopN；24h 两套默认同时启用。只勾选累计降水、不勾选任何 ERA5 要素即可做单要素检索。</p></div>
+            <div class="form-grid">
+              <label class="field checkbox span2"><label><input id="cfgPrecipEnabled" type="checkbox">启用 GMCP 累计降水目标检索</label></label>
+            </div>
+            <div class="chipset-block">
+              <label class="chipset-label">累计降水窗口（北京时间）</label>
+              <div class="chipset" id="chipPrecipWindows"></div>
+            </div>
+            <div class="form-grid">
+              <label class="field"><span>每个窗口相似 TopN</span>
+                <input id="cfgPrecipTopn" type="number" min="1" step="1"></label>
+              <label class="field span2"><span>累计降水概率阈值（mm，逗号分隔）</span>
+                <input id="cfgPrecipThresh" type="text" placeholder="0.1,30,50"></label>
+            </div>
+            <div class="hint" id="precipHint"></div>
           </div>
 
           <div class="panel span2">

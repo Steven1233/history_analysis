@@ -19,8 +19,9 @@ from . import viz
 from .config import ELEMENTS, SearchConfig, var_key, var_label
 from .datasource import GMCP_RE, Store, window_offsets
 from .formula import compile_formula
+from .precip import PRECIP_PRODUCTS, product_path
 from .readers import Grid, DEFAULT_IO_WORKERS, era5_axes, gmcp_axes, \
-    nearest_slice, read_era5_batch, read_gmcp_batch
+    nearest_slice, precip_axes, read_era5_batch, read_gmcp_batch, read_precip_batch
 
 Progress = Callable[[str, str, int, int, str], None]
 
@@ -54,75 +55,128 @@ def run_search(cfg: SearchConfig, store: Store, progress: Progress = _noop,
         raise ValueError("未指定目标日期")
     target = datetime.strptime(cfg.target_date, "%Y-%m-%d").date()
 
-    # ── 步骤 0：样本集与网格 ─────────────────────────────────────────
+    has_era5 = bool(cfg.variables)
+    has_precip = cfg.precip_active
+    if not has_era5 and not has_precip:
+        raise ValueError("至少需要选择 ERA5 检索要素或 GMCP 累计降水目标变量")
+
+    grid = None
+    fields: Dict[str, np.ndarray] = {}
+    read_dates: List[date] = []
+    hist_dates: List[date] = []
+    hist_idx: List[int] = []
+    target_i = 0
+    n_hist = 0
+    ranking: Dict[str, Dict] = {}
+    combine: Dict[str, Dict] = {}
+    gmcp_grid_desc: Dict = {}
+    samples: Dict = {"n_candidates": 0, "n_used": 0, "years": [0, 0],
+                     "read_errors": [], "n_read_errors": 0}
+
+    # ── 步骤 0–5：ERA5 要素检索（可选）──────────────────────────────
+    if has_era5:
+        t0 = time.time()
+        progress("samples", "解析历史样本与区域", 0, 1, "扫描数据源覆盖")
+        dates = store.available_dates(cfg)
+        if not dates:
+            raise ValueError("所选年份/月份范围内没有找到任何齐备的 ERA5 历史样本，"
+                             "请检查数据源登记与配置")
+        axes = _resolve_axes(cfg, store, dates[0])
+        grid = Grid(axes["era5_lat"], axes["era5_lon"], cfg)
+        gmcp_grid_desc = Grid(axes["gmcp_lat"], axes["gmcp_lon"], cfg).desc()
+        tick("样本解析", t0)
+
+        read_dates = sorted(set(dates) | {target})
+        target_i = read_dates.index(target)
+        hist_idx = [i for i in range(len(read_dates)) if i != target_i]
+        hist_dates = [read_dates[i] for i in hist_idx]
+
+        # 步骤 1：数据访问（直读原始 NC）
+        t0 = time.time()
+        fields, read_errors = _read_fields(cfg, store, read_dates, axes, progress,
+                                           should_stop)
+        stop_check()
+        tick("数据直读", t0)
+        if read_errors:
+            ok = {d for d, _ in _present_dates(fields, cfg, read_dates, store)}
+            dates = [d for d in dates if d in ok]
+            hist_idx = [read_dates.index(d) for d in dates]
+            hist_dates = dates
+        n_hist = len(hist_dates)
+        if n_hist == 0:
+            raise ValueError("没有任何可用的 ERA5 历史样本（全部读取失败）")
+
+        # 步骤 2：特征处理
+        t0 = time.time()
+        progress("features", "特征处理（由近及远 · 距离权重 · 标准化）", 0, 1, "")
+        order = grid.order
+        w_ord = grid.weight[order]
+        feats = _build_features(cfg, fields, order, hist_idx, target_i)
+        stop_check()
+        tick("特征处理", t0)
+
+        # 步骤 3–4：相似度与排名
+        t0 = time.time()
+        ranking = _similarity_and_rank(cfg, feats, hist_dates, target, w_ord,
+                                       progress, should_stop)
+        stop_check()
+        tick("相似度与排名", t0)
+
+        # 步骤 5：组合策略
+        t0 = time.time()
+        combine = _combine(cfg, ranking)
+        tick("组合", t0)
+
+        samples = {
+            "n_candidates": len(read_dates) - 1,
+            "n_used": n_hist,
+            "years": [min(d.year for d in hist_dates), max(d.year for d in hist_dates)],
+            "read_errors": read_errors[:50],
+            "n_read_errors": len(read_errors),
+        }
+
+    # ── 步骤 6：GMCP 累计降水目标检索（第一优先）─────────────────────
+    precip: Dict = {"enabled": has_precip, "available": False, "windows": {}}
+    precip_lat = precip_lon = None
+    if has_precip:
+        t0 = time.time()
+        precip = _precip_search(cfg, store, target, progress, should_stop)
+        precip_lat = precip.pop("_lat", None)
+        precip_lon = precip.pop("_lon", None)
+        stop_check()
+        tick("累计降水检索", t0)
+        if not has_era5 and precip.get("available"):
+            all_similar = sorted({r["date"] for w in precip["windows"].values()
+                                  for r in w.get("ranking", [])})
+            years = sorted({int(d[:4]) for d in all_similar}) or [0]
+            samples = {
+                "n_candidates": int(precip.get("n_candidates") or 0),
+                "n_used": len(all_similar),
+                "years": [years[0], years[-1]],
+                "read_errors": [],
+                "n_read_errors": 0,
+            }
+
+    if not has_era5 and not precip.get("available"):
+        raise ValueError("GMCP 累计降水目标检索不可用："
+                         + "；".join(w.get("reason", "") for w in
+                                    (precip.get("skipped") or [])[:3])
+                         or "目标日期或历史年份缺少累计降水产品，请先完成数据预处理并登记")
+
+    # ── 步骤 7：ERA5 路径的 GMCP 小时窗口降水统计 ────────────────────
     t0 = time.time()
-    progress("samples", "解析历史样本与区域", 0, 1, "扫描数据源覆盖")
-    dates = store.available_dates(cfg)
-    if not dates:
-        raise ValueError("所选年份/月份范围内没有找到任何齐备的历史样本，"
-                         "请检查数据源登记与配置")
-    axes = _resolve_axes(cfg, store, dates[0])
-    grid = Grid(axes["era5_lat"], axes["era5_lon"], cfg)
-    gmcp_lat, gmcp_lon = axes["gmcp_lat"], axes["gmcp_lon"]
-    gmcp_grid = Grid(gmcp_lat, gmcp_lon, cfg)
-    i_pt = int(np.argmin(np.abs(gmcp_lat - cfg.point_lat)))
-    j_pt = int(np.argmin(np.abs(gmcp_lon - cfg.point_lon)))
-    tick("样本解析", t0)
-
-    read_dates = sorted(set(dates) | {target})
-    if target not in read_dates:  # pragma: no cover - 集合语义保证
-        read_dates.append(target)
-    target_i = read_dates.index(target)
-    hist_idx = [i for i in range(len(read_dates)) if i != target_i]
-    hist_dates = [read_dates[i] for i in hist_idx]
-
-    # ── 步骤 1：数据访问（直读原始 NC）───────────────────────────────
-    t0 = time.time()
-    fields, read_errors = _read_fields(cfg, store, read_dates, axes, progress,
-                                       should_stop)
-    stop_check()
-    tick("数据直读", t0)
-
-    if read_errors:
-        ok = {d for d, _ in _present_dates(fields, cfg, read_dates, store)}
-        keep = [d for d in dates if d in ok]
-        dates = keep
-        hist_idx = [read_dates.index(d) for d in keep]
-        hist_dates = keep
-
-    n_hist = len(hist_dates)
-    if n_hist == 0:
-        raise ValueError("没有任何可用的历史样本（全部读取失败）")
-
-    # ── 步骤 2：特征处理 ─────────────────────────────────────────────
-    t0 = time.time()
-    progress("features", "特征处理（由近及远 · 距离权重 · 标准化）", 0, 1, "")
-    order = grid.order
-    w_ord = grid.weight[order]
-    feats = _build_features(cfg, fields, order, hist_idx, target_i)
-    stop_check()
-    tick("特征处理", t0)
-
-    # ── 步骤 3–4：相似度与排名 ───────────────────────────────────────
-    t0 = time.time()
-    ranking = _similarity_and_rank(cfg, feats, hist_dates, target, w_ord,
-                                   progress, should_stop)
-    stop_check()
-    tick("相似度与排名", t0)
-
-    # ── 步骤 5：组合策略 ─────────────────────────────────────────────
-    t0 = time.time()
-    combine = _combine(cfg, ranking)
-    tick("组合", t0)
-
-    # ── 步骤 6：降水统计 ─────────────────────────────────────────────
-    t0 = time.time()
-    rain = _rain_stats(cfg, store, combine, gmcp_lat, gmcp_lon, i_pt, j_pt,
-                       progress, should_stop)
-    stop_check()
+    rain: Dict = {"per_time": {}, "n_hours_read": 0, "n_hours_missing": 0,
+                  "n_moments": 0}
+    if has_era5 and combine:
+        glat, glon = _hourly_axes(store) or (axes["gmcp_lat"], axes["gmcp_lon"])
+        i_pt = int(np.argmin(np.abs(glat - cfg.point_lat)))
+        j_pt = int(np.argmin(np.abs(glon - cfg.point_lon)))
+        rain = _rain_stats(cfg, store, combine, glat, glon, i_pt, j_pt,
+                           progress, should_stop)
+        stop_check()
     tick("降水统计", t0)
 
-    # ── 步骤 7：概率产品 ─────────────────────────────────────────────
+    # ── 步骤 8：概率产品 ─────────────────────────────────────────────
     t0 = time.time()
     products = _products(cfg, rain)
     tick("概率产品", t0)
@@ -130,28 +184,27 @@ def run_search(cfg: SearchConfig, store: Store, progress: Progress = _noop,
     # ── 出图 ─────────────────────────────────────────────────────────
     t0 = time.time()
     progress("figures", "生成图表", 0, 1, "")
-    figures = {}
+    figures: Dict[str, str] = {}
     if out_dir:
-        figures = viz.render_all(cfg, grid, gmcp_lat, gmcp_lon, fields, read_dates,
-                                 target_i, ranking, combine, products, out_dir,
-                                 progress=progress)
+        if has_era5 and grid is not None:
+            figures = viz.render_all(cfg, grid, axes["gmcp_lat"], axes["gmcp_lon"],
+                                     fields, read_dates, target_i, ranking, combine,
+                                     products, out_dir, progress=progress)
+        if precip.get("available") and precip_lat is not None:
+            figures.update(viz.render_precip_all(cfg, precip, precip_lat, precip_lon,
+                                                 out_dir, progress=progress))
     tick("出图", t0)
 
     result = {
         "config": cfg.to_dict(),
         "target_date": cfg.target_date,
-        "grid": grid.desc(),
-        "gmcp_grid": gmcp_grid.desc(),
-        "samples": {
-            "n_candidates": len(read_dates) - 1,
-            "n_used": n_hist,
-            "years": [min(d.year for d in hist_dates), max(d.year for d in hist_dates)],
-            "read_errors": read_errors[:50],
-            "n_read_errors": len(read_errors),
-        },
+        "grid": grid.desc() if grid is not None else None,
+        "gmcp_grid": precip.get("grid") or gmcp_grid_desc,
+        "samples": samples,
         "times": cfg.times,
         "ranking": ranking,
         "combine": combine,
+        "precip": precip,
         "products": products,
         "figures": figures,
         "timings": timings,
@@ -177,10 +230,15 @@ def _resolve_axes(cfg: SearchConfig, store: Store, sample_day: date) -> Dict:
     lat_sl = nearest_slice(lat_full, lat_lo, lat_hi)
     lon_sl = nearest_slice(lon_full, lon_lo, lon_hi)
 
-    gmcp_file = _first_gmcp_file(store)
-    if gmcp_file is None:
-        raise ValueError("无法定位任何 GMCP 降水文件，请先登记数据源")
-    glat, glon = gmcp_axes(gmcp_file)
+    gmcp_file = _first_hourly_file(store)
+    if gmcp_file is not None:
+        glat, glon = gmcp_axes(gmcp_file)
+    else:
+        gp = _first_precip_file(store)
+        if gp is not None:
+            glat, glon = precip_axes(gp)
+        else:  # 没有降水数据时仍用 ERA5 网格占位，降水统计自然为空
+            glat, glon = lat_full, lon_full
     gli = nearest_slice(glat, lat_lo, lat_hi)
     glo = nearest_slice(glon, lon_lo, lon_hi)
 
@@ -191,8 +249,8 @@ def _resolve_axes(cfg: SearchConfig, store: Store, sample_day: date) -> Dict:
     }
 
 
-def _first_gmcp_file(store: Store) -> Optional[str]:
-    """取一个 GMCP 文件用于读取全球网格坐标（网格全球统一，读哪个都一样）。"""
+def _first_hourly_file(store: Store) -> Optional[str]:
+    """取一个 GMCP 逐小时文件用于读取全球网格坐标（网格全球统一）。"""
     for root in store.gmcp_roots():
         if not os.path.isdir(root):
             continue
@@ -202,6 +260,24 @@ def _first_gmcp_file(store: Store) -> Optional[str]:
                 for n in sorted(os.listdir(yp)):
                     if GMCP_RE.match(n):
                         return os.path.join(yp, n)
+    return None
+
+
+def _hourly_axes(store: Store):
+    p = _first_hourly_file(store)
+    return gmcp_axes(p) if p else None
+
+
+def _first_precip_file(store: Store, keys: Optional[List[str]] = None) -> Optional[str]:
+    """取一个已登记的累计降水产品文件（用于读取网格坐标）。"""
+    keys = keys or list(PRECIP_PRODUCTS)
+    for key in keys:
+        for root in store.precip_roots(key):
+            if not os.path.isdir(root):
+                continue
+            for name in sorted(os.listdir(root)):
+                if PRECIP_PRODUCTS[key].match_filename(name) is not None:
+                    return os.path.join(root, name)
     return None
 
 
@@ -504,6 +580,201 @@ def _combine(cfg: SearchConfig, ranking: Dict) -> Dict:
             "diagnose": _inter_diagnose(cfg, ranking, ts),
         }
     return out
+
+
+# ── 步骤 6：GMCP 累计降水目标检索 ─────────────────────────────────────
+def _precip_search(cfg: SearchConfig, store: Store, target: date,
+                   progress: Progress,
+                   should_stop: Optional[Callable[[], bool]]) -> Dict:
+    """以预处理的北京时间累计降水产品为目标变量做相似检索并统计产品。
+
+    每个窗口（24h 两套、12h 两段、6h 四段）独立检索 TopN，再由相似日期的
+    累计降水场给出平均场、中位数场与各阈值概率场。
+    """
+    keys = [k for k in cfg.precip_windows if k in PRECIP_PRODUCTS]
+    progress("precip", "GMCP 累计降水目标检索", 0, max(1, len(keys)),
+             "定位目标日产品")
+    skipped: List[Dict] = []
+    target_paths: Dict[str, str] = {}
+    for key in keys:
+        p = store.find_precip(key, target)
+        if p:
+            target_paths[key] = p
+        else:
+            skipped.append({"key": key, "reason": f"{PRECIP_PRODUCTS[key].label()} "
+                                                   f"目标日产品缺失"})
+    usable = list(target_paths)
+    if not usable:
+        return {"enabled": True, "available": False, "windows": {},
+                "skipped": skipped, "reason": "目标日期缺少全部累计降水产品"}
+
+    lat_lo = cfg.center_lat - cfg.half_span_deg
+    lat_hi = cfg.center_lat + cfg.half_span_deg
+    lon_lo = cfg.center_lon - cfg.half_span_deg
+    lon_hi = cfg.center_lon + cfg.half_span_deg
+
+    probe = target_paths[usable[0]]
+    plat, plon = precip_axes(probe)
+    lsl = nearest_slice(plat, lat_lo, lat_hi)
+    osl = nearest_slice(plon, lon_lo, lon_hi)
+    p_lat, p_lon = plat[lsl], plon[osl]
+    p_grid = Grid(p_lat, p_lon, cfg)
+    order = p_grid.order
+    w_ord = p_grid.weight[order]
+    shape = (p_lat.size, p_lon.size)
+    i_pt = int(np.argmin(np.abs(p_lat - cfg.point_lat)))
+    j_pt = int(np.argmin(np.abs(p_lon - cfg.point_lon)))
+
+    dates = store.available_precip_dates(cfg, usable)
+    read_dates = sorted(set(dates) | {target})
+    target_i = read_dates.index(target)
+
+    jobs, path_meta = [], {}
+    for key in usable:
+        for d in read_dates:
+            p = store.find_precip(key, d)
+            if not p:
+                continue
+            jobs.append((p, lat_lo, lat_hi, lon_lo, lon_hi))
+            path_meta[p] = (key, d)
+
+    total = len(jobs)
+    done = {"n": 0}
+    progress("precip", "直读累计降水产品切片", 0, total,
+             f"共 {total} 个产品文件")
+
+    def on_done(k: int) -> None:
+        done["n"] += k
+        progress("precip", "直读累计降水产品切片", done["n"], total,
+                 f"{done['n']}/{total} 文件")
+
+    cache = read_precip_batch(jobs, workers=DEFAULT_IO_WORKERS, on_done=on_done,
+                              should_stop=should_stop)
+    arrays: Dict[str, np.ndarray] = {
+        k: np.full((len(read_dates),) + shape, np.nan, dtype=np.float32)
+        for k in usable
+    }
+    for p, (key, d) in path_meta.items():
+        arr = cache.get(p)
+        if arr is None or arr.shape != shape:
+            continue
+        arrays[key][read_dates.index(d)] = arr
+
+    # 目标日必须可读，否则该窗口无法作为检索锚点
+    usable = [k for k in usable if np.isfinite(arrays[k][target_i]).all()]
+    skipped += [{"key": k, "reason": f"{PRECIP_PRODUCTS[k].label()} 目标日读取失败"}
+                for k in target_paths if k not in usable]
+    if not usable:
+        return {"enabled": True, "available": False, "windows": {},
+                "skipped": skipped, "reason": "目标日累计降水产品读取失败",
+                "_lat": p_lat, "_lon": p_lon, "grid": p_grid.desc()}
+
+    ok_idx = [i for i, d in enumerate(read_dates)
+              if all(np.isfinite(arrays[k][i]).all() for k in usable)]
+    hist_idx = [i for i in ok_idx if i != target_i]
+    hist_dates = [read_dates[i] for i in hist_idx]
+    if not hist_dates:
+        return {"enabled": True, "available": False, "windows": {},
+                "skipped": skipped, "reason": "没有可用的历史累计降水样本",
+                "_lat": p_lat, "_lon": p_lon, "grid": p_grid.desc()}
+
+    excl_mask = np.array([abs((d - target).days) <= cfg.exclude_days
+                          for d in hist_dates], dtype=bool)
+    formula_fn = (compile_formula(cfg.similarity_formula)
+                  if cfg.similarity == "custom" else None)
+    windows: Dict[str, Dict] = {}
+    for ki, key in enumerate(usable, 1):
+        if should_stop and should_stop():
+            raise Cancelled("检索已取消")
+        H = arrays[key][hist_idx].reshape(len(hist_idx), -1)[:, order]
+        x = arrays[key][target_i].reshape(-1)[order]
+        if cfg.feature_process == "standardize":
+            sigma = float(np.std(H))
+            if sigma > 1e-9:
+                H, x = H / sigma, x / sigma
+        elif cfg.feature_process == "normalize":
+            lo, hi = float(np.min(H)), float(np.max(H))
+            if hi - lo > 1e-9:
+                H = (H - lo) / (hi - lo)
+                x = (x - lo) / (hi - lo)
+        si = _sim_scores(cfg, H, x, w_ord, formula_fn)
+        si = np.where(excl_mask, np.inf, si)
+        order_idx = np.argsort(si, kind="stable")
+        rows, used_pos = [], []
+        for rank, pos in enumerate(order_idx, 1):
+            if not np.isfinite(si[pos]):
+                break
+            arr_i = hist_idx[pos]
+            rows.append({"rank": rank, "date": hist_dates[pos].isoformat(),
+                         "si": float(si[pos]),
+                         "mm": round(float(arrays[key][arr_i, i_pt, j_pt]), 2)})
+            used_pos.append(arr_i)
+            if len(rows) >= cfg.precip_topn:
+                break
+        if not rows:
+            skipped.append({"key": key, "reason": f"{PRECIP_PRODUCTS[key].label()} "
+                                                   "没有可用的相似历史日"})
+            progress("precip", "累计降水相似排名", ki, len(usable),
+                     f"{PRECIP_PRODUCTS[key].label()} 无相似日")
+            continue
+
+        top = arrays[key][used_pos]
+        vals = top[:, i_pt, j_pt].astype(np.float64)
+        mean_f = top.mean(axis=0)
+        median_f = np.median(top, axis=0)
+        ths = sorted({float(t) for t in cfg.precip_thresholds})
+        spatial = {"mean": mean_f, "median": median_f}
+        stats = {}
+        for th in ths:
+            spatial[f"prob_{th}"] = (top >= th).mean(axis=0)
+            stats[str(th)] = {
+                "prob": round(float((vals >= th).mean()), 4),
+                "count": int((vals >= th).sum()),
+                "n": int(vals.size),
+            }
+        prod = PRECIP_PRODUCTS[key]
+        start, end = prod.bounds_utc(target)
+        lst = timedelta(hours=8)
+        windows[key] = {
+            "key": key,
+            "label": prod.label(),
+            "group": prod.group,
+            "file": os.path.basename(target_paths[key]),
+            "start_utc": start.strftime("%Y-%m-%d %H:%M"),
+            "end_utc": end.strftime("%Y-%m-%d %H:%M"),
+            "start_lst": (start + lst).strftime("%Y-%m-%d %H:%M"),
+            "end_lst": (end + lst).strftime("%Y-%m-%d %H:%M"),
+            "n_candidates": len(hist_dates),
+            "n_valid": len(rows),
+            "topn": int(cfg.precip_topn),
+            "thresholds": ths,
+            "ranking": rows,
+            "products": {
+                "n_valid": int(vals.size),
+                "mean_mm": round(float(vals.mean()), 2),
+                "median_mm": round(float(np.median(vals)), 2),
+                "max_mm": round(float(vals.max()), 2),
+                "stats": stats,
+                "samples": [{"date": r["date"], "mm": r["mm"]}
+                            for r in sorted(rows, key=lambda r: -r["mm"])],
+                "spatial": spatial,
+            },
+        }
+        progress("precip", "累计降水相似排名", ki, len(usable),
+                 f"{prod.label()} · TopN {len(rows)}")
+
+    return {
+        "enabled": True,
+        "available": bool(windows),
+        "windows": windows,
+        "skipped": skipped,
+        "n_candidates": len(hist_dates),
+        "n_windows": len(usable),
+        "point": [cfg.point_lat, cfg.point_lon],
+        "thresholds": sorted({float(t) for t in cfg.precip_thresholds}),
+        "grid": p_grid.desc(),
+        "_lat": p_lat, "_lon": p_lon,
+    }
 
 
 # ── 步骤 6 ────────────────────────────────────────────────────────────

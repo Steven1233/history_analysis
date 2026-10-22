@@ -8,10 +8,11 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 
 const VIEW_META = {
   dashboard: ['数据看板', '数据源覆盖与系统概况'],
-  sources:   ['数据源', '登记 ERA5 要素目录与 GMCP 降水目录'],
-  config:    ['检索配置', '统一参数模型：两项需求只是两组取值'],
-  run:       ['执行进程', '七步统一检索流水线的实时进度'],
-  result:    ['结果产品', '相似时刻集合、降水概率与图表'],
+  sources:   ['数据源', '登记 ERA5 要素目录、GMCP 降水目录与预处理产物'],
+  preprocess:['数据预处理', 'GMCP 逐小时降水 → 北京时间 24/12/6 小时累计产品'],
+  config:    ['检索配置', '统一参数模型：GMCP 累计降水为第一优先目标变量'],
+  run:       ['执行进程', '统一检索流水线的实时进度'],
+  result:    ['结果产品', '相似时刻集合、累计降水概率产品与图表'],
   ops:       ['操作记录', '任务历史与操作留痕'],
 };
 
@@ -20,6 +21,7 @@ const STAGES = [
   ['read', '直读切片'],
   ['features', '特征处理'],
   ['similarity', '相似度排名'],
+  ['precip', '累计降水检索'],
   ['rain', '降水统计'],
   ['figures', '生成图表'],
 ];
@@ -37,8 +39,12 @@ const state = {
   tick: 0,
   lastStage: null,
   busy: false,
+  prepMeta: null,           // 预处理页面静态字典
+  prepJob: null,            // 当前预处理任务 id
+  prepTimer: null,
 };
 const TASK_KEY = 'histsim.task';       // 当前任务持久化键（F5 后自动续跟踪）
+const PREP_KEY = 'histsim.preprocess'; // 当前预处理任务持久化键
 const COLLAPSE_KEY = 'histsim.collapsed';  // 配置分区折叠状态
 
 /* ── 通用工具 ─────────────────────────────────────────────────────── */
@@ -80,6 +86,7 @@ function go(view) {
   renderWizard(view);
   if (view === 'dashboard') loadDashboard();
   if (view === 'sources') loadSources();
+  if (view === 'preprocess') loadPreprocess();
   if (view === 'run') refreshRun();
   if (view === 'result') fillResultPicker();  // 直接点导航进结果页时也要填充任务下拉
   if (view === 'ops') loadOps();
@@ -87,7 +94,8 @@ function go(view) {
 $$('.nav-item').forEach(b => b.addEventListener('click', () => go(b.dataset.view)));
 
 /* ── 主流程步骤条（仅进度提示，与左侧导航并存） ──────────────────── */
-const WIZ = [['sources', '数据源'], ['config', '检索配置'], ['run', '执行进程'], ['result', '结果产品']];
+const WIZ = [['preprocess', '数据预处理'], ['sources', '数据源'],
+             ['config', '检索配置'], ['run', '执行进程'], ['result', '结果产品']];
 function renderWizard(view) {
   const bar = $('#wizBar');
   if (!bar) return;
@@ -130,7 +138,7 @@ function renderTopStats() {
   const ys = d.years || {};
   const disk = d.disk || {};
   $('#topStats').innerHTML = `
-    <div class="stat-pill"><span>数据源</span><b>${num(d.counts.n_era5)}</b><span>/ ${num(d.counts.n_gmcp)}</span></div>
+    <div class="stat-pill"><span>数据源</span><b>${num(d.counts.n_era5)}</b><span>/ ${num((d.counts.n_gmcp || 0) + (d.counts.n_gmcp_rain || 0))}</span></div>
     <div class="stat-pill"><span>数据文件</span><b>${num(d.counts.n_files)}</b></div>
     <div class="stat-pill"><span>覆盖年份</span><b>${ys.from ? ys.from + '–' + ys.to : '—'}</b></div>
     ${disk.free_gb != null ? `<div class="stat-pill ok"><span>磁盘剩余</span><b>${disk.free_gb}</b><span>GB</span></div>` : ''}`;
@@ -144,7 +152,8 @@ function renderKPIs(d) {
   const nEl = Object.keys(d.coverage || {}).length;
   $('#dashKpis').innerHTML = [
     ['ERA5 要素目录', num(c.n_era5), `已登记 ${nEl} 类要素可检索`, ''],
-    ['GMCP 降水目录', num(c.n_gmcp), '全球 0.1° 逐小时降水', 'info'],
+    ['GMCP 降水目录', num((c.n_gmcp || 0) + (c.n_gmcp_rain || 0)),
+      `逐小时源 ${num(c.n_gmcp || 0)} · 累计降水产品 ${num(c.n_gmcp_rain || 0)}`, 'info'],
     ['数据文件总量', num(c.n_files), '不搬移、不预处理，按需直读', 'accent'],
     ['覆盖时间跨度', ys.from ? `${ys.to - ys.from + 1} 年` : '—',
       ys.from ? `${ys.from} – ${ys.to} · 共 ${num((ys.list || []).length)} 个年份` : '尚未登记数据源', 'warn'],
@@ -154,7 +163,12 @@ function renderKPIs(d) {
 
 function renderCoverage(d) {
   const cov = d.coverage || {};
-  const elName = k => { const e = (d.elements || []).find(x => x.key === k); return e ? e.name : k; };
+  const elName = k => {
+    const e = (d.elements || []).find(x => x.key === k);
+    if (e) return e.name;
+    const p = (d.precip_windows || []).find(x => x.key === k);
+    return p ? p.name : k;
+  };
   const rows = [];
   rows.push('<div class="cov-row"><div class="cov-label cov-head sp">要素 · 年份</div>' +
     Array.from({ length: 12 }, (_, i) => `<div class="cov-head">${i + 1}</div>`).join('') + '</div>');
@@ -196,7 +210,12 @@ function renderSources() {
   const s = state.sources;
   if (!s) return;
   $('#srcCount').textContent = s.sources.length;
-  const elName = k => { const e = (state.meta?.elements || []).find(x => x.key === k); return e ? e.name : k; };
+  const elName = k => {
+    const e = (state.meta?.elements || []).find(x => x.key === k);
+    if (e) return e.name;
+    const p = (state.meta?.precip_windows || []).find(x => x.key === k);
+    return p ? p.name : k;
+  };
   if (!s.sources.length) {
     $('#srcTable').innerHTML = '<div class="empty">还没有登记任何数据源。</div>';
     return;
@@ -247,7 +266,192 @@ $('#btnScan').addEventListener('click', async () => {
   } finally { btn.disabled = false; }
 });
 
-/* ══════════════════════════ 3 · 检索配置 ══════════════════════════ */
+/* ══════════════════════ 3 · 数据预处理 ══════════════════════ */
+function prepCollect() {
+  return {
+    source_root: $('#prepSrc').value.trim(),
+    output_root: $('#prepOut').value.trim(),
+    year_from: Number($('#prepYFrom').value),
+    year_to: Number($('#prepYTo').value),
+    groups: chipValues('#prepGroups'),
+    overwrite: $('#prepOverwrite').checked,
+  };
+}
+
+async function loadPreprocess() {
+  if (!state.prepMeta) {
+    try {
+      const m = await api('/api/preprocess/meta');
+      state.prepMeta = m;
+      const d = m.defaults || {};
+      if (!$('#prepOut').value) $('#prepOut').value = d.output_root || '';
+      if (!$('#prepYFrom').value) $('#prepYFrom').value = d.year_from || 2000;
+      if (!$('#prepYTo').value) $('#prepYTo').value = d.year_to || 2024;
+      chipset('#prepGroups', m.groups.map(g => g.key), k => {
+        const g = m.groups.find(x => x.key === k); return g ? g.name : k;
+      }, d.groups || m.groups.map(g => g.key));
+      $('#prepGroups').addEventListener('click', () => updatePrepHint());
+      updatePrepHint();
+    } catch (e) { toast('预处理信息加载失败：' + e.message, 'bad'); return; }
+  }
+  if (state.prepJob) startPrepPolling();
+}
+
+function updatePrepHint() {
+  const m = state.prepMeta;
+  if (!m) return;
+  const groups = new Set(chipValues('#prepGroups'));
+  const prods = (m.products || []).filter(p => groups.has(p.group));
+  $('#prepScanHint').innerHTML = prods.length
+    ? `将产出 ${prods.length} 类产品：` + prods.map(p =>
+        `<code>${esc(p.filename_example)}</code>`).join('、')
+    : '请至少选择一个产品分组。';
+}
+
+$('#btnPrepScan').addEventListener('click', async () => {
+  const p = prepCollect();
+  if (!p.source_root) { toast('请先填写 GMCP 逐小时源目录', 'bad'); return; }
+  const btn = $('#btnPrepScan'); btn.disabled = true;
+  $('#prepScanHint').innerHTML = '<span class="spinner"></span>正在扫描源目录覆盖…';
+  try {
+    const r = await post('/api/preprocess/scan', p);
+    const years = Object.keys(r.years || {});
+    const months = [...new Set(years.flatMap(y => Object.keys(r.years[y])))].sort((a, b) => a - b);
+    $('#prepScanHint').innerHTML = r.ok
+      ? `源目录可用：<b style="color:var(--amber)">${num(r.n_files)}</b> 个小时文件 · 年份 ${years[0] || '—'}–${years[years.length - 1] || '—'} · 月份 ${months.join(',') || '—'}`
+        + (r.axes ? ` · 网格 ${r.axes.n_lat}×${r.axes.n_lon}` : '')
+        + (r.warning ? `<br><span style="color:var(--warn)">${esc(r.warning)}</span>` : '')
+      : `未发现可用小时文件：${esc(r.warning || '')}`;
+    if (!r.ok) toast('源目录未发现 GMCP 小时文件', 'bad');
+  } catch (e) {
+    $('#prepScanHint').textContent = '扫描失败：' + e.message;
+    toast('扫描失败：' + e.message, 'bad');
+  } finally { btn.disabled = false; }
+});
+
+$('#btnPrepStart').addEventListener('click', async () => {
+  const p = prepCollect();
+  if (!p.source_root) { toast('请先填写 GMCP 逐小时源目录', 'bad'); return; }
+  if (!p.groups.length) { toast('请至少选择一个产品分组', 'bad'); return; }
+  if (!p.output_root) { toast('请填写预处理输出目录', 'bad'); return; }
+  const btn = $('#btnPrepStart'); btn.disabled = true;
+  try {
+    const r = await post('/api/preprocess/start', p);
+    state.prepJob = r.job_id;
+    try { localStorage.setItem(PREP_KEY, r.job_id); } catch (e) { /* 忽略 */ }
+    $('#prepLog').innerHTML = '';
+    $('#prepResult').hidden = true;
+    $('#btnPrepRegister').disabled = true;
+    $('#prepJobId').textContent = r.job_id;
+    toast(`预处理任务已启动：<span class="mono">${esc(r.job_id)}</span>`, 'ok');
+    startPrepPolling();
+  } catch (e) {
+    toast('启动失败：' + e.message, 'bad');
+  } finally { btn.disabled = false; }
+});
+
+function stopPrepPolling() {
+  clearInterval(state.prepTimer);
+  state.prepTimer = null;
+}
+
+function startPrepPolling() {
+  stopPrepPolling();
+  const tick = async () => {
+    if (!state.prepJob) return;
+    try {
+      const p = await api('/api/preprocess/progress?job_id=' + encodeURIComponent(state.prepJob));
+      renderPrepProgress(p);
+      if (p.state !== 'running') {
+        stopPrepPolling();
+        try { localStorage.removeItem(PREP_KEY); } catch (e) { /* 忽略 */ }
+        $('#btnPrepCancel').disabled = true;
+        $('#btnPrepStart').disabled = false;
+        if (p.state === 'done') {
+          $('#btnPrepRegister').disabled = false;
+          renderPrepResult(p);
+          toast(`预处理完成：写出 ${num((p.result || {}).n_written || 0)} 个产品`, 'ok');
+          loadDashboard();
+        } else if (p.state === 'cancelled') {
+          toast('预处理已取消');
+        } else {
+          toast('预处理失败：' + esc(p.error), 'bad');
+        }
+      }
+    } catch (e) {
+      stopPrepPolling();
+      toast('预处理进度查询失败：' + e.message, 'bad');
+    }
+  };
+  state.prepTimer = setInterval(tick, 900);
+  tick();
+}
+
+function renderPrepProgress(p) {
+  $('#prepJobId').textContent = p.job_id;
+  $('#prepBar').style.width = Math.min(100, p.pct) + '%';
+  $('#prepPct').textContent = p.pct + '%';
+  $('#prepMsg').textContent = p.msg || p.label || '';
+  $('#prepElapsed').textContent = `已用 ${p.elapsed_s}s`;
+  $('#prepHeadNote').innerHTML = `<span class="badge amber">${esc(p.label)}</span>` +
+    (p.total ? ` <span class="mono">${num(p.done)} / ${num(p.total)}</span>` : '') +
+    ` · 源目录 <span class="mono">${esc((p.params || {}).source_root || '')}</span>`;
+  $('#btnPrepCancel').disabled = p.state !== 'running';
+  const el = $('#prepLog');
+  const near = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  el.innerHTML = (p.log || []).map(l =>
+    `<div class="ln ${l.stage === 'error' ? 'err' : l.stage === 'done' ? 'ok' : ''}">
+      <span class="ts">${l.t}s</span><span>${esc(l.label)}</span></div>`).join('');
+  if (near) el.scrollTop = el.scrollHeight;
+}
+
+function renderPrepResult(p) {
+  const r = p.result || {};
+  const box = $('#prepResult');
+  box.hidden = false;
+  const keys = (r.products || []).map(k => {
+    const prod = (state.prepMeta.products || []).find(x => x.key === k);
+    return prod ? prod.label : k;
+  });
+  box.innerHTML = `<div class="panel-head"><h3>预处理结果</h3>
+    <p>输出目录 <code>${esc(r.output_root || '')}</code> · 可直接登记为检索数据源。</p></div>
+    <div class="kpis">
+      <div class="kpi accent"><div class="k-label">写出产品</div><div class="k-value">${num(r.n_written)}<small>个</small></div>
+        <div class="k-note">${r.year_from}–${r.year_to} · 共 ${num(r.n_expected)} 个产品时次</div></div>
+      <div class="kpi"><div class="k-label">已有跳过</div><div class="k-value">${num(r.n_skipped)}</div>
+        <div class="k-note">未覆盖已有文件</div></div>
+      <div class="kpi warn"><div class="k-label">缺测未写</div><div class="k-value">${num(r.n_incomplete)}</div>
+        <div class="k-note">小时文件不齐的日期</div></div>
+      <div class="kpi"><div class="k-label">写出失败</div><div class="k-value">${num(r.n_errors)}</div>
+        <div class="k-note">磁盘/权限等错误</div></div>
+    </div>
+    <div class="hint">产品：${keys.map(esc).join('、') || '—'}
+      ${(r.error_samples || []).length ? `<br>异常样例：<span class="mono">${r.error_samples.slice(0, 4).map(esc).join(' / ')}</span>` : ''}</div>`;
+}
+
+$('#btnPrepCancel').addEventListener('click', async () => {
+  if (!state.prepJob) return;
+  try { await post('/api/preprocess/cancel', { job_id: state.prepJob }); toast('已发送取消请求'); }
+  catch (e) { toast('取消失败：' + e.message, 'bad'); }
+});
+
+$('#btnPrepRegister').addEventListener('click', async () => {
+  const root = $('#prepOut').value.trim();
+  if (!root) { toast('请先填写预处理输出目录', 'bad'); return; }
+  const btn = $('#btnPrepRegister'); btn.disabled = true;
+  try {
+    const r = await post('/api/preprocess/register', { output_root: root });
+    toast(`已登记 ${r.registered.length} 项预处理数据源`, 'ok');
+    $('#prepNote').innerHTML = `登记 ${r.registered.length} 项，可在「数据源」页查看。`;
+    state.sources = r.sources || null;
+    loadDashboard();
+  } catch (e) {
+    toast('登记失败：' + e.message, 'bad');
+    btn.disabled = false;
+  }
+});
+
+/* ══════════════════════════ 4 · 检索配置 ══════════════════════════ */
 function chipset(container, values, labeler, selected) {
   const set = new Set(selected.map(String));
   $(container).innerHTML = values.map(v => {
@@ -281,6 +485,15 @@ async function initConfig() {
     const e = m.elements.find(x => x.key === k); return e ? e.name : k;
   }, ['u', 'v', 'rh']);
   chipset('#chipLevels', m.levels, v => v, [925, 500]);
+  chipset('#chipPrecipWindows', (m.precip_windows || []).map(p => p.key), k => {
+    const p = (m.precip_windows || []).find(x => x.key === k); return p ? p.name : k;
+  }, m.default_precip_windows || []);
+  $('#cfgPrecipEnabled').addEventListener('change', () => {
+    syncPrecipMode(); updateTemplateDiff();
+  });
+  $('#chipPrecipWindows').addEventListener('click', () => { syncPrecipMode(); updateTemplateDiff(); });
+  $('#cfgPrecipTopn').addEventListener('input', updateTemplateDiff);
+  $('#cfgPrecipThresh').addEventListener('input', updateTemplateDiff);
   $('#btnAllInter').addEventListener('click', () => {
     state.vars.forEach(v => { v.role = 'inter'; }); syncVarChips(); applyRolesToGroups();
   });
@@ -334,6 +547,22 @@ function syncFormulaRow() {
   $('#formulaRow').hidden = $('#cfgSimilarity').value !== 'custom';
 }
 
+/* 累计降水目标检索：关闭时置灰窗口选择 */
+function syncPrecipMode() {
+  const on = $('#cfgPrecipEnabled').checked;
+  const block = $('#chipPrecipWindows').closest('.chipset-block');
+  block.classList.toggle('disabled', !on);
+  $('#chipPrecipWindows').classList.toggle('disabled', !on);
+  $('#cfgPrecipTopn').disabled = !on;
+  $('#cfgPrecipThresh').disabled = !on;
+  const picked = chipValues('#chipPrecipWindows');
+  $('#precipHint').innerHTML = on
+    ? (picked.length
+      ? `已选 ${picked.length} 个窗口；每个窗口独立检索 TopN，并生成平均/中位数/≥阈值概率产品。`
+      : '已启用但未选择窗口：请至少勾选一个累计降水窗口。')
+    : '未启用累计降水目标检索：仅使用 ERA5 要素。';
+}
+
 /* 模板差异计数：相对内置模板默认值改了多少项 */
 function updateTemplateDiff() {
   const el = $('#tmplDiff');
@@ -346,6 +575,8 @@ function updateTemplateDiff() {
     ['year_from', c.year_from], ['year_to', c.year_to], ['inter_topn', c.inter_topn],
     ['direct_topn', c.direct_topn], ['feature_process', c.feature_process],
     ['similarity', c.similarity], ['sample_mode', c.sample_mode], ['period_days', c.period_days],
+    ['precip_enabled', c.precip_enabled], ['precip_topn', c.precip_topn],
+    ['precip_windows', (c.precip_windows || []).join(',')],
   ];
   const n = pairs.filter(([k, v]) => String(t[k]) !== String(v)).length;
   el.textContent = n ? `已修改 ${n} 项相对模板默认值（其余沿用 ${t.name}）。` : '与模板默认值一致。';
@@ -370,6 +601,9 @@ function applyTemplate(key) {
   $('#cfgPlotDirect').checked = !!t.plot_direct_fields;
   $('#cfgEnable24').checked = !!t.enable_24h;
   $('#cfgPartial').checked = !!t.partial_intersection;
+  $('#cfgPrecipEnabled').checked = !!t.precip_enabled;
+  set('#cfgPrecipTopn', t.precip_topn);
+  set('#cfgPrecipThresh', (t.precip_thresholds || []).join(','));
   const m = state.meta;
   chipset('#chipMonths', [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], v => v + ' 月', t.months);
   chipset('#chipTimes', m.times, v => String(v).padStart(2, '0') + 'UTC', t.times);
@@ -379,10 +613,13 @@ function applyTemplate(key) {
     const e = m.elements.find(x => x.key === k); return e ? e.name : k;
   }, els);
   chipset('#chipLevels', m.levels, v => v, lvs);
+  chipset('#chipPrecipWindows', (m.precip_windows || []).map(p => p.key), k => {
+    const p = (m.precip_windows || []).find(x => x.key === k); return p ? p.name : k;
+  }, t.precip_windows || []);
   syncVarChips(t.variables, t.inter_group, t.direct_group);
   const d = state.dashboard;
   if (!$('#cfgDate').value && d && d.years.to) $('#cfgDate').value = `${d.years.to}-06-30`;
-  syncSampleMode(); syncFormulaRow(); syncRegionRect(); updateTemplateDiff();
+  syncSampleMode(); syncFormulaRow(); syncPrecipMode(); syncRegionRect(); updateTemplateDiff();
 }
 
 /** 依据勾选的要素×层次重建变量卡片，尽量保留已有角色分配。 */
@@ -465,6 +702,10 @@ function collect() {
     rain_window_24h: parseInts($('#cfgRainWin24').value),
     rain_thresholds: parseFloats($('#cfgThresh').value),
     enable_24h: $('#cfgEnable24').checked,
+    precip_enabled: $('#cfgPrecipEnabled').checked,
+    precip_windows: chipValues('#chipPrecipWindows'),
+    precip_topn: Number($('#cfgPrecipTopn').value),
+    precip_thresholds: parseFloats($('#cfgPrecipThresh').value),
   };
 }
 
@@ -481,9 +722,12 @@ function clearFieldErrors() { $$('#view-config .field-err').forEach(e => e.remov
 
 function cfgGuard() {
   const c = collect();
+  const hasPrecip = c.precip_enabled && c.precip_windows.length;
   if (!c.target_date) return { id: 'cfgDate', msg: '请选择目标日期（同期模式为必填）' };
-  if (!c.variables.length) return { id: 'chipElements', msg: '请至少勾选一个要素×层次组合' };
-  if (!c.inter_group.length && !c.direct_group.length) return { id: 'varChips', msg: '请为变量指定交集组或直取组（点击变量卡片切换角色）' };
+  if (!c.variables.length && !hasPrecip) return { id: 'chipElements', msg: '请至少勾选一个 ERA5 要素，或启用 GMCP 累计降水目标检索' };
+  if (!c.inter_group.length && !c.direct_group.length && !hasPrecip) return { id: 'varChips', msg: '请为变量指定交集组或直取组（点击变量卡片切换角色）' };
+  if (c.precip_enabled && !c.precip_windows.length) return { id: 'chipPrecipWindows', msg: '已启用累计降水检索，请至少勾选一个窗口' };
+  if (c.precip_enabled && !c.precip_thresholds.length) return { id: 'cfgPrecipThresh', msg: '请填写累计降水概率阈值' };
   if (c.sample_mode === 'calendar' && !c.months.length) return { id: 'chipMonths', msg: '请至少选择一个月份' };
   if (!c.times.length) return { id: 'chipTimes', msg: '请至少选择一个检索时次' };
   if (c.similarity === 'custom' && !c.similarity_formula) return { id: 'cfgSimilarityFormula', msg: '自定义相似度需填写公式，例如 sqrt(sum(w*d*d))' };
@@ -496,6 +740,8 @@ const ERR_RULES = [
   [/特征处理/, 'cfgFeatureProcess'], [/公式/, 'cfgSimilarityFormula'], [/相似度/, 'cfgSimilarity'],
   [/月份/, 'chipMonths'], [/时次/, 'chipTimes'], [/中心/, 'cfgLat'], [/半边长/, 'cfgSpan'],
   [/TopN/i, 'cfgInterTopn'], [/年份/, 'cfgYFrom'], [/距离分区|分区/, 'cfgZones'], [/降水阈值/, 'cfgThresh'],
+  [/累计降水窗口/, 'chipPrecipWindows'], [/累计降水相似 TopN/, 'cfgPrecipTopn'],
+  [/累计降水概率阈值/, 'cfgPrecipThresh'],
 ];
 function showApiErrors(errors) {
   (errors || []).forEach(msg => {
@@ -526,6 +772,10 @@ $('#btnPreview').addEventListener('click', async () => {
       return;
     }
     const c = p.config;
+    const precipCard = c.precip_enabled ? `
+        <div class="kpi ${p.precip_ready ? 'accent' : 'warn'}"><div class="k-label">累计降水候选 / 产品文件</div>
+          <div class="k-value">${num(p.n_precip_samples)}<small>日 / ${num(p.n_precip_files)} 个</small></div>
+          <div class="k-note">${num(p.n_precip_windows)} 个窗口 · ${p.precip_ready ? '目标日产品齐备' : '缺少预处理产物，请先登记'}</div></div>` : '';
     panel.innerHTML = `<div class="panel-head"><h3>代价预估</h3>
       <p>配置指纹 <code>${esc(c.fingerprint)}</code> · 相同指纹的重复检索可直接复用切片缓存。</p></div>
       <div class="kpis">
@@ -533,6 +783,7 @@ $('#btnPreview').addEventListener('click', async () => {
           <div class="k-note">${p.sample_range ? p.sample_range[0] + ' ~ ' + p.sample_range[1] : '无齐备样本'}</div></div>
         <div class="kpi info"><div class="k-label">待读 ERA5 文件</div><div class="k-value">${num(p.n_era5_files)}<small>个</small></div>
           <div class="k-note">要素×层次 ${c.variable_keys.length} · 时次 ${c.times.length} · 每要素 ${num(p.n_era5_files_per_variable)} 日</div></div>
+        ${precipCard}
         <div class="kpi ${p.ready ? 'accent' : 'warn'}"><div class="k-label">数据覆盖度</div><div class="k-value">${p.coverage_pct}<small>%</small></div>
           <div class="k-note">${p.ready ? '数据就绪' : '存在 ' + num(p.n_gaps) + ' 个要素·年月缺口'}</div></div>
         <div class="kpi warn"><div class="k-label">交集 TopN</div><div class="k-value">${num(c.inter_topn)}<small>/ ${num(p.n_samples)}</small></div>
@@ -860,6 +1111,7 @@ async function loadResult(taskId) {
 
 /* 图表排序权重：field_* → field_direct_* → rain_bars → spatial_* */
 function figRank(k) {
+  if (k.startsWith('precip_')) return 0;
   if (k.startsWith('field_direct_')) return 2;
   if (k.startsWith('field_')) return 1;
   if (k.startsWith('rain_bars')) return 3;
@@ -916,6 +1168,9 @@ function renderConfigPanel(cfg, targetDate) {
     ['直取组', `${(cfg.direct_group || []).join(', ') || '—'} · TopN ${cfg.direct_topn}`],
     ['部分交集', cfg.partial_intersection ? `开启（命中 ≥ ${cfg.partial_min_hits}）` : '关闭'],
     ['直取要素场单独出图', cfg.plot_direct_fields ? '是' : '否'],
+    ['GMCP 累计降水检索', cfg.precip_enabled
+      ? `${(cfg.precip_windows || []).length} 个窗口 · 每窗 TopN ${cfg.precip_topn} · 阈值 ${(cfg.precip_thresholds || []).map(x => '≥' + x + 'mm').join(' / ')}`
+      : '未启用'],
     ['降水窗口', cfgRain(cfg)],
     ['降水阈值', (cfg.rain_thresholds || []).map(x => '≥' + x + ' mm').join(' / ') || '—'],
   ];
@@ -925,6 +1180,61 @@ function renderConfigPanel(cfg, targetDate) {
     <p>以下参数随结果一并落盘为 <code>result.json</code> 的 <code>config</code> 字段，
     与检索当时完全一致，可用于复核结论或复现本次检索；历史任务的配置同样由此回放。</p></div>
     <div class="cfg-grid">${cells}</div></div>`;
+}
+
+/* ── GMCP 累计降水目标检索产品（第一优先） ─────────────────────── */
+function renderPrecipPanel(r) {
+  const P = r.precip || {};
+  if (!P.enabled) return '';
+  const skipped = (P.skipped || []).map(s => s.reason).filter(Boolean);
+  if (!P.available) {
+    return `<div class="panel"><div class="panel-head"><h3>GMCP 累计降水目标检索</h3>
+      <p>未取得可用的累计降水检索结果。</p></div>
+      <div class="hint" style="color:var(--warn)">${esc(P.reason || '目标日或历史年份缺少累计降水产品')}
+      ${skipped.length ? '<br>跳过：' + skipped.map(esc).join('；') : ''}
+      <br>请先在「数据预处理」页生成产品，并点击「登记预处理产物」。</div></div>`;
+  }
+  const wins = Object.entries(P.windows || {});
+  const tabs = wins.map(([k, w], i) =>
+    `<button class="tab ${i ? '' : 'active'}" data-tab="q${i}">${esc(w.label || k)}（${num(w.n_valid)}）</button>`).join('');
+  const panes = wins.map(([k, w], i) => {
+    const p = w.products || {};
+    const thRows = Object.entries(p.stats || {}).map(([th, v]) =>
+      `<tr><td class="mono">≥ ${esc(th)} mm</td><td class="num">${pct(v.prob)}</td>
+       <td class="num">${num(v.count)} / ${num(v.n)}</td></tr>`).join('');
+    const rows = (w.ranking || []).slice(0, 30).map(x =>
+      `<tr><td class="num">${x.rank}</td><td class="date">${esc(x.date)}</td>
+       <td class="num">${Number(x.si).toFixed(4)}</td><td class="num">${x.mm}</td></tr>`).join('');
+    return `<div class="tabpane" data-pane="q${i}" ${i ? 'hidden' : ''}>
+      <div class="hint">目标产品 <code>${esc(w.file || '')}</code> ·
+        北京时间 ${esc(w.start_lst || '')} → ${esc(w.end_lst || '')} ·
+        候选 ${num(w.n_candidates)} · 入产品 ${num(w.n_valid)} · TopN ${num(w.topn)}
+        ${w.spatial_ready ? ' · 空间产品已生成' : ''}</div>
+      <div class="kpis" style="margin-bottom:14px">
+        <div class="kpi accent"><div class="k-label">相似日平均累计降水</div>
+          <div class="k-value">${p.mean_mm}<small>mm</small></div><div class="k-note">统计点 ${P.point[0]}, ${P.point[1]}</div></div>
+        <div class="kpi"><div class="k-label">相似日中位数</div>
+          <div class="k-value">${p.median_mm}<small>mm</small></div><div class="k-note">n = ${num(p.n_valid)}</div></div>
+        <div class="kpi warn"><div class="k-label">样本内最大值</div>
+          <div class="k-value">${p.max_mm}<small>mm</small></div><div class="k-note">TopN 相似日极值</div></div>
+      </div>
+      <div class="grid2">
+        <div><div class="section-title">阈值概率（统计点）</div>
+          <div class="table-wrap"><table><thead><tr><th>阈值</th><th class="num">概率</th>
+          <th class="num">达到 / 有效</th></tr></thead><tbody>${thRows || '<tr><td colspan="3">无统计</td></tr>'}</tbody></table></div></div>
+        <div><div class="section-title">相似历史日（按相似度名次）</div>
+          <div class="table-wrap" style="max-height:320px"><table><thead><tr><th class="num">#</th>
+          <th>日期</th><th class="num">相似度指数 SI</th><th class="num">点累计 mm</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="4">无相似日</td></tr>'}</tbody></table></div></div>
+      </div>
+    </div>`;
+  }).join('');
+  return `<div class="panel"><div class="panel-head"><h3>GMCP 累计降水目标检索产品</h3>
+    <p>每个窗口独立检索 TopN 相似历史日，再用这些日期的同一窗口累计降水场统计平均、中位数与阈值概率。
+      24 小时两套窗口为第一优先。</p></div>
+    <div class="tabs">${tabs}</div>${panes}
+    ${skipped.length ? `<div class="hint" style="color:var(--warn)">跳过：${skipped.map(esc).join('；')}</div>` : ''}
+  </div>`;
 }
 
 function renderResult(r) {
@@ -959,7 +1269,11 @@ function renderResult(r) {
   // 检索配置回放（紧随概要，查结果时先看到当时的参数）
   boxes.push(renderConfigPanel(r.config || {}, r.target_date));
 
-  // 组合策略 + 诊断
+  // GMCP 累计降水目标检索产品（第一优先）
+  const precipPanel = renderPrecipPanel(r);
+  if (precipPanel) boxes.push(precipPanel);
+
+  // 组合策略 + 诊断（仅 ERA5 路径有）
   const cards = Object.entries(r.combine || {}).map(([ts, c]) => {
     const dg = c.diagnose || {};
     const curve = (dg.curve || []);
@@ -984,12 +1298,13 @@ function renderResult(r) {
         <span style="font-size:10.5px">横轴为 TopN 取值，柱高与数字为对应的交集个数</span>
       </div>${emptyHint}</div>`;
   }).join('');
-  boxes.push(`<div class="panel"><div class="panel-head"><h3>组合策略与可行性诊断</h3>
+  if (cards) boxes.push(`<div class="panel"><div class="panel-head"><h3>组合策略与可行性诊断</h3>
     <p>交集 = 各交集组要素 TopN 的交集；直取 = 各直取组要素 TopN 的并集；合并 = 交集 ∪ 直取。</p></div>
     <div class="combine-grid">${cards || '<div class="empty">无组合结果。</div>'}</div></div>`);
 
-  // 相似时刻明细 + 排名
+  // 相似时刻明细 + 排名（仅 ERA5 路径有）
   const keys = [...(r.config.inter_group || []), ...(r.config.direct_group || [])];
+  if (keys.length) {
   const detailTabs = Object.entries(r.combine || {}).map(([ts, c], i) => {
     const inter = r.config.inter_group || [];
     const head = `<tr><th>#</th><th>日期</th><th>来源标注</th>` +
@@ -1028,8 +1343,9 @@ function renderResult(r) {
   boxes.push(`<div class="panel"><div class="panel-head"><h3>各要素相似度排名</h3>
     <p>SI 越小越相似；界面最多展示前 ${num(r.rank_view_limit)} 条，后端按 TopN 全量计算。</p></div>
     <div class="tabs">${rankBtns}</div>${rankTabs}</div>`);
+  }
 
-  // 降水概率
+  // 降水概率（ERA5 路径的 GMCP 小时窗口统计）
   const prod = (r.products && r.products.by_time) || {};
   const rainTabs = Object.entries(prod).map(([ts, p], i) => {
     const thRows = Object.entries(p.stats || {}).map(([th, v]) =>
@@ -1059,7 +1375,7 @@ function renderResult(r) {
   }).join('');
   const rainBtns = Object.keys(prod).map((ts, i) =>
     `<button class="tab ${i ? '' : 'active'}" data-tab="p${i}">${ts === '24h' ? '24 小时窗口' : '锚定 ' + esc(ts) + ' UTC'}（${num(prod[ts].n_valid)}）</button>`).join('');
-  boxes.push(`<div class="panel"><div class="panel-head"><h3>降水概率产品</h3>
+  if (rainBtns) boxes.push(`<div class="panel"><div class="panel-head"><h3>降水概率产品</h3>
     <p>对入组相似时刻在 GMCP 逐小时降水场中按窗口累加，得到统计点概率与空间概率场。</p></div>
     <div class="tabs">${rainBtns}</div>${rainTabs || '<div class="empty">无降水产品（入组相似时刻为空）。</div>'}</div>`);
 
@@ -1161,6 +1477,15 @@ async function loadOps() {
   initRegionPicker();
   await loadDashboard();
   loadSources();
+  // 恢复未完成的预处理任务（进度在服务端，页面重开后继续跟踪）
+  try {
+    const pj = localStorage.getItem(PREP_KEY);
+    if (pj) {
+      const p = await api('/api/preprocess/progress?job_id=' + encodeURIComponent(pj));
+      if (p.state === 'running') state.prepJob = pj;
+      else localStorage.removeItem(PREP_KEY);
+    }
+  } catch (e) { try { localStorage.removeItem(PREP_KEY); } catch (err) { /* 忽略 */ } }
   go('dashboard');
 
   // F5 / 重开浏览器后自动续跟踪运行中的任务

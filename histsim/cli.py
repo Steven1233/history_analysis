@@ -44,6 +44,38 @@ def cmd_register(args) -> int:
     return 0 if rep["registered"] else 1
 
 
+def cmd_preprocess(args) -> int:
+    from .api import SearchSession
+    from .precip import GROUPS, run_preprocess
+    groups = [g for g in (args.groups or "24h,12h,6h").split(",") if g]
+    bad = [g for g in groups if g not in GROUPS]
+    if bad:
+        print("未知产品分组:", ", ".join(bad))
+        return 1
+    keys = [k for g in groups for k in GROUPS[g]]
+    last = [""]
+
+    def report(stage, label, done, total, msg=""):
+        line = f"[{stage}] {label} {done}/{total} {msg}"
+        if line != last[0]:
+            print(line, flush=True)
+            last[0] = line
+
+    rep = run_preprocess(args.source_root, args.output_root, keys,
+                         args.year_from, args.year_to,
+                         overwrite=args.overwrite, progress=report)
+    print(f"写出 {rep['n_written']} · 跳过 {rep['n_skipped']} · "
+          f"缺测 {rep['n_incomplete']} · 失败 {rep['n_errors']}")
+    print(f"输出目录: {rep['output_root']}")
+    if args.register:
+        s = SearchSession()
+        r = s.register_root(rep["output_root"], depth=1)
+        for item in r["registered"]:
+            print(f"  + [{item['kind']}] {item['element']} {item['n_files']} 文件")
+        s.close()
+    return 0
+
+
 def cmd_dashboard(args) -> int:
     from .api import SearchSession
     s = SearchSession()
@@ -454,6 +486,16 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("dashboard", help="查看数据源与覆盖概况")
     p.set_defaults(func=cmd_dashboard)
+
+    p = sub.add_parser("preprocess", help="GMCP 逐小时降水 → 北京时间累计降水产品")
+    p.add_argument("--source-root", required=True, help="GMCP 逐小时源目录")
+    p.add_argument("--output-root", required=True, help="预处理产品输出目录")
+    p.add_argument("--groups", default="24h,12h,6h", help="产品分组，逗号分隔")
+    p.add_argument("--year-from", type=int, default=2000)
+    p.add_argument("--year-to", type=int, default=2024)
+    p.add_argument("--overwrite", action="store_true", help="覆盖已有产品")
+    p.add_argument("--register", action="store_true", help="完成后自动登记为数据源")
+    p.set_defaults(func=cmd_preprocess)
 
     for name, fn in (("preview", cmd_preview), ("search", cmd_search)):
         p = sub.add_parser(name, help="代价预估" if name == "preview" else "执行检索")

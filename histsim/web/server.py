@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .. import __version__
 from ..api import SearchSession
 from ..config import BUILTIN_KEYS, ELEMENTS
+from ..precip import PRECIP_PRODUCTS
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 DEFAULT_HOST = "127.0.0.1"
@@ -88,6 +89,10 @@ def _meta(s: SearchSession, q, b):
         "data_dir": s.store.data_dir,
         "elements": [{"key": k, "name": v[2], "units": v[3], "nc_var": v[1],
                       "file_element": v[0]} for k, v in ELEMENTS.items()],
+        "precip_windows": [{"key": k, "name": p.label(), "group": p.group,
+                            "duration_h": p.duration_h, "folder": p.folder}
+                           for k, p in PRECIP_PRODUCTS.items()],
+        "default_precip_windows": ["24h_2020", "24h_0808"],
         "templates": s.templates(),
         "builtin_keys": BUILTIN_KEYS,
         "times": [0, 6, 12, 18],
@@ -146,6 +151,42 @@ def _register(s: SearchSession, q, b):
 @route("POST", "/api/sources/remove")
 def _remove_source(s: SearchSession, q, b):
     return 200, s.remove_source(int(b["id"]))
+
+
+# ── 数据预处理 ────────────────────────────────────────────────────────
+@route("GET", "/api/preprocess/meta")
+def _preprocess_meta(s: SearchSession, q, b):
+    return 200, s.preprocess_meta()
+
+
+@route("POST", "/api/preprocess/scan")
+def _preprocess_scan(s: SearchSession, q, b):
+    return 200, s.preprocess_scan(b)
+
+
+@route("POST", "/api/preprocess/start")
+def _preprocess_start(s: SearchSession, q, b):
+    return 200, {"ok": True, **s.preprocess_start(b)}
+
+
+@route("GET", "/api/preprocess/progress")
+def _preprocess_progress(s: SearchSession, q, b):
+    return 200, {"ok": True, **s.preprocess_progress(str(_q(q, "job_id", "")))}
+
+
+@route("POST", "/api/preprocess/cancel")
+def _preprocess_cancel(s: SearchSession, q, b):
+    return 200, s.preprocess_cancel(str(b.get("job_id") or ""))
+
+
+@route("POST", "/api/preprocess/register")
+def _preprocess_register(s: SearchSession, q, b):
+    return 200, s.preprocess_register(b)
+
+
+@route("GET", "/api/preprocess/jobs")
+def _preprocess_jobs(s: SearchSession, q, b):
+    return 200, {"ok": True, "jobs": s.preprocess_jobs()}
 
 
 @route("POST", "/api/preview")

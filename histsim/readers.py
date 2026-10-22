@@ -389,6 +389,53 @@ def read_gmcp_batch(jobs: List[tuple], workers: int = 0,
     return {p: arr for p, arr in results}
 
 
+# ── GMCP 累计降水产品 ─────────────────────────────────────────────────
+def _rain_var_name(ds) -> str:
+    if "rain" in ds.variables:
+        return "rain"
+    if "rain_rate" in ds.variables:
+        return "rain_rate"
+    raise KeyError("文件中不存在 rain/rain_rate 变量")
+
+
+def precip_axes(path: str):
+    with Dataset(path) as ds:
+        return (np.asarray(ds.variables["lat"][:], dtype=np.float64),
+                np.asarray(ds.variables["lon"][:], dtype=np.float64))
+
+
+def read_precip_region(path: str, lat_lo: float, lat_hi: float,
+                       lon_lo: float, lon_hi: float):
+    """读取累计降水产品的目标区域，返回 ``(arr2d, lat, lon)``（mm）。"""
+    with Dataset(path) as ds:
+        lat = np.asarray(ds.variables["lat"][:], dtype=np.float64)
+        lon = np.asarray(ds.variables["lon"][:], dtype=np.float64)
+        li = nearest_slice(lat, lat_lo, lat_hi)
+        lo = nearest_slice(lon, lon_lo, lon_hi)
+        arr = ds.variables[_rain_var_name(ds)][li, lo]
+        out_lat, out_lon = lat[li], lon[lo]
+    a = np.asarray(arr, dtype=np.float32)
+    a[~np.isfinite(a)] = 0.0
+    a[a < 0] = 0.0
+    return a, out_lat, out_lon
+
+
+def _precip_worker(job):
+    path, lat_lo, lat_hi, lon_lo, lon_hi = job
+    try:
+        arr, _, _ = read_precip_region(path, lat_lo, lat_hi, lon_lo, lon_hi)
+        return path, arr, None
+    except Exception as exc:
+        return path, None, f"{type(exc).__name__}: {exc}"
+
+
+def read_precip_batch(jobs: List[tuple], workers: int = 0,
+                      on_done=None, should_stop=None) -> Dict[str, np.ndarray]:
+    """并行读取一批累计降水产品切片，返回 ``{path: arr2d}``。"""
+    results, _ = _pool_map(list(jobs), _precip_worker, workers, on_done, should_stop)
+    return {p: arr for p, arr in results}
+
+
 def _self_check() -> None:
     import glob
     import time

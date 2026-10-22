@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Tuple
 
 from .formula import check_formula
+from .precip import DEFAULT_WINDOWS, PRECIP_PRODUCTS
 
 # 要素表：key -> (ERA5 文件 element 串, NC 变量短名, 中文名, 单位, 是否默认标准化)
 ELEMENTS: Dict[str, tuple] = {
@@ -137,12 +138,26 @@ class SearchConfig:
     point_lat: float = 23.1652
     point_lon: float = 113.3405
 
+    # ── GMCP 累计降水目标检索（V2.1.0，第一优先）────────────────────
+    # 预处理的北京时间累计降水产品直接作为目标变量：每个窗口独立检索 TopN，
+    # 再由相似日期的累计降水场统计均值/中位数/阈值概率产品。
+    precip_enabled: bool = True
+    precip_windows: List[str] = field(default_factory=lambda: list(DEFAULT_WINDOWS))
+    precip_topn: int = 30
+    precip_thresholds: List[float] = field(
+        default_factory=lambda: [0.1, 30.0, 50.0])
+
     target_date: str = ""  # 'YYYY-MM-DD'
 
     # ── 派生 ──────────────────────────────────────────────────────────
     @property
     def variable_keys(self) -> List[str]:
         return [var_key(e, l) for e, l in self.variables]
+
+    @property
+    def precip_active(self) -> bool:
+        """是否启用 GMCP 累计降水作为目标检索变量。"""
+        return bool(self.precip_enabled and self.precip_windows)
 
     @property
     def radius_km(self) -> float:
@@ -167,8 +182,18 @@ class SearchConfig:
         unknown = [k for k in set(self.inter_group) | set(self.direct_group) if k not in keys]
         if unknown:
             errs.append("组合策略引用了未勾选的要素: " + ", ".join(sorted(unknown)))
-        if not self.variables:
-            errs.append("至少需要勾选一个要素×层次组合")
+        if not self.variables and not self.precip_active:
+            errs.append("至少需要勾选一个 ERA5 要素×层次，或启用 GMCP 累计降水目标检索")
+        if self.precip_active:
+            bad = [k for k in self.precip_windows if k not in PRECIP_PRODUCTS]
+            if bad:
+                errs.append("未知的累计降水窗口: " + ", ".join(sorted(bad)))
+            if self.precip_topn < 1:
+                errs.append("累计降水相似 TopN 必须 ≥ 1")
+            if not self.precip_thresholds:
+                errs.append("累计降水概率阈值不能为空")
+            elif any(float(t) < 0 for t in self.precip_thresholds):
+                errs.append("累计降水概率阈值不能为负数")
         if not self.months:
             errs.append("月份不能为空")
         if not self.times:
@@ -193,8 +218,8 @@ class SearchConfig:
             errs.append("交集 TopN 必须 ≥ 1")
         if self.direct_group and self.direct_topn < 1:
             errs.append("直取 TopN 必须 ≥ 1")
-        if not self.inter_group and not self.direct_group:
-            errs.append("交集组与直取组不能同时为空")
+        if not self.inter_group and not self.direct_group and not self.precip_active:
+            errs.append("交集组与直取组不能同时为空（或启用累计降水目标检索）")
         if self.partial_intersection and not (1 <= self.partial_min_hits <= len(self.inter_group)):
             errs.append("部分交集命中数必须在 1 ～ 交集组要素数之间")
         if not self.rain_window:
@@ -260,6 +285,10 @@ def builtin_template(key: str) -> SearchConfig:
             rain_window=[-2, -1, 0, 1, 2, 3],
             rain_thresholds=[0.1, 50.0, 100.0],
             enable_24h=False,
+            precip_enabled=True,
+            precip_windows=list(DEFAULT_WINDOWS),
+            precip_topn=30,
+            precip_thresholds=[0.1, 30.0, 50.0],
         )
     if key == "plan_B":
         return SearchConfig(
@@ -292,6 +321,10 @@ def builtin_template(key: str) -> SearchConfig:
             rain_window=[-2, -1, 0, 1, 2, 3],
             rain_thresholds=[0.1, 50.0],
             enable_24h=True,
+            precip_enabled=True,
+            precip_windows=list(DEFAULT_WINDOWS),
+            precip_topn=30,
+            precip_thresholds=[0.1, 30.0, 50.0],
         )
     raise KeyError(f"未知内置模板: {key}")
 
@@ -340,6 +373,25 @@ def _self_check() -> None:
                                similarity_formula="__import__('os')").validate())
     assert any("自定义相似度公式" in e
                for e in a.copy(similarity="custom", similarity_formula="").validate())
+    # ── V2.1.0：GMCP 累计降水目标检索（第一优先）────────────────────
+    assert SearchConfig().precip_enabled and SearchConfig().precip_windows == \
+        ["24h_2020", "24h_0808"]
+    assert SearchConfig().precip_topn == 30
+    assert a.precip_active and b.precip_active
+    assert a.fingerprint() != a.copy(precip_windows=["12h_08"]).fingerprint()
+    assert a.fingerprint() != a.copy(precip_topn=12).fingerprint()
+    assert any("累计降水窗口" in e
+               for e in a.copy(precip_windows=["不存在"]).validate())
+    assert any("累计降水相似 TopN" in e
+               for e in a.copy(precip_topn=0).validate())
+    # 仅用累计降水检索（不勾选任何 ERA5 要素）也是合法配置
+    only_rain = SearchConfig(variables=[], inter_group=[], direct_group=[],
+                             target_date="2024-06-01")
+    assert not only_rain.validate(), only_rain.validate()
+    # 两者都不选时必须报错
+    assert any("ERA5 要素" in e
+               for e in SearchConfig(variables=[], inter_group=[], direct_group=[],
+                                     precip_enabled=False).validate())
     # standardize 字段已删除：旧字段不再出现在模型里
     assert "standardize" not in SearchConfig.__dataclass_fields__
     print("config self-check OK")
