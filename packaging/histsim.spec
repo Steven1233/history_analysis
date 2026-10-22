@@ -7,8 +7,10 @@
 * onedir 下 `sys._MEIPASS` 即 `_internal`，模块与数据保持相对布局，
   代码里基于 `__file__` 定位的 static / 图层调用 无需改写。
 
-构建：  python -m PyInstaller packaging/histsim.spec --noconfirm
-产物：  dist/Histsim/Histsim.exe 与 dist/Histsim/_internal/
+构建（必须显式指定 dist/work 路径，否则产物落到仓库根，安装脚本找不到）：
+    python -m PyInstaller packaging/histsim.spec --noconfirm --clean \
+        --distpath packaging/dist --workpath packaging/build
+产物：  packaging/dist/Histsim/Histsim.exe 与 packaging/dist/Histsim/_internal/
 """
 import os
 

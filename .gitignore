@@ -12,6 +12,9 @@ packaging/build/
 packaging/dist/
 packaging/installer/
 release/
+# 未指定 --distpath/--workpath 时 PyInstaller 会落到仓库根
+/build/
+/dist/
 
 # ── 数据文件（体积大，靠登记数据源使用，不入库）──────────────────────
 *.nc
