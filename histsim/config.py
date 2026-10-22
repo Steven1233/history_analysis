@@ -24,6 +24,9 @@ ELEMENTS: Dict[str, tuple] = {
     "rh": ("relative_humidity", "r", "相对湿度", "%"),
 }
 
+# 基本要素选择区里的「第一要素」：GMCP 累计降水（无气压层，独立完整检索流程）
+PRECIP_ELEMENT_KEY = "gmcp_precip"
+
 # 6 小时降水窗口共用的锚定偏移（小时，相对检索时次）
 DEFAULT_RAIN_WINDOW = [-2, -1, 0, 1, 2, 3]
 # 24 小时窗口：当日 22UTC ～ 次日 21UTC
@@ -160,6 +163,16 @@ class SearchConfig:
         return bool(self.precip_enabled and self.precip_windows)
 
     @property
+    def participating_keys(self) -> List[str]:
+        """参与组合的变量（交集组 ∪ 直取组，按声明顺序去重）。"""
+        return list(dict.fromkeys(self.inter_group + self.direct_group))
+
+    @property
+    def single_element_mode(self) -> bool:
+        """只选择一个要素（一个变量）时不取交集，直接按该要素排名执行完整流程。"""
+        return len(self.participating_keys) == 1
+
+    @property
     def radius_km(self) -> float:
         """矩形的粗估外接尺度，仅用于展示与权重分区说明。"""
         return round(self.half_span_deg * 111.0, 1)
@@ -256,6 +269,16 @@ class SearchConfig:
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg
+
+    def normalize(self) -> "SearchConfig":
+        """单一要素的默认配置：未指定组合角色时自动归入交集组。
+
+        引擎对 ``single_element_mode`` 直接采用该要素的 TopN 榜单（不做交集），
+        因此这里只是让界面/接口省略角色设置时也能执行完整流程。
+        """
+        if not self.inter_group and not self.direct_group and len(self.variable_keys) == 1:
+            self.inter_group = self.variable_keys[:]
+        return self
 
 
 # ── 内置模板（两项需求固化为参数）────────────────────────────────────
@@ -392,6 +415,12 @@ def _self_check() -> None:
     assert any("ERA5 要素" in e
                for e in SearchConfig(variables=[], inter_group=[], direct_group=[],
                                      precip_enabled=False).validate())
+    # 单一要素：未设置角色时自动归入交集组，并标记为单要素完整流程
+    one = SearchConfig(variables=[["t", 850]], inter_group=[], direct_group=[],
+                       precip_enabled=False, target_date="2024-06-01").normalize()
+    assert one.inter_group == ["t850"] and one.single_element_mode
+    assert not one.validate(), one.validate()
+    assert not SearchConfig().single_element_mode  # 默认三变量仍走交集
     # standardize 字段已删除：旧字段不再出现在模型里
     assert "standardize" not in SearchConfig.__dataclass_fields__
     print("config self-check OK")

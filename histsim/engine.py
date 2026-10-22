@@ -48,7 +48,7 @@ def run_search(cfg: SearchConfig, store: Store, progress: Progress = _noop,
         if should_stop and should_stop():
             raise Cancelled("检索已取消")
 
-    errs = cfg.validate()
+    errs = cfg.normalize().validate()
     if errs:
         raise ValueError("配置校验失败: " + "; ".join(errs))
     if not cfg.target_date:
@@ -515,16 +515,45 @@ def _inter_diagnose(cfg: SearchConfig, ranking: Dict, ts: str) -> Dict:
     return {"n_candidates": n_cand, "min_feasible_topn": min_topn, "curve": curve}
 
 
+def _combine_single(cfg: SearchConfig, ranking: Dict, ts: str, key: str) -> Dict:
+    """单要素模式：直接采用该要素的 TopN 排名，不做交集与自动放宽。"""
+    topn = cfg.inter_topn if key in cfg.inter_group else cfg.direct_topn
+    rows = list(ranking.get(key, {}).get(ts, []))[:max(1, topn)]
+    final = [r["date"] for r in rows]
+    as_inter = key in cfg.inter_group
+    return {
+        "inter": final if as_inter else [],
+        "direct": final if not as_inter else [],
+        "final": final,
+        "n_inter": len(final) if as_inter else 0,
+        "n_direct": len(final) if not as_inter else 0,
+        "n_final": len(final),
+        "hits": {d: 1 for d in final},
+        "source": {d: f"单要素 TopN（{var_label(key)}，不做交集）" for d in final},
+        "single_element": True,
+        "inter_topn_used": max(1, topn),
+        "inter_topn_auto": False,
+        "diagnose": {"n_candidates": len(ranking.get(key, {}).get(ts, [])),
+                     "min_feasible_topn": 1, "curve": []},
+    }
+
+
 def _combine(cfg: SearchConfig, ranking: Dict) -> Dict:
     """交集组 ∩ + 直取组 ∪；支持部分交集（至少 k 个要素命中）。
 
+    只选择一个要素时不做交集：直接采用该要素的 TopN 榜单执行完整流程。
     严格交集为空、但确实存在「各要素都命中」的日期时，自动把交集 TopN 放宽到
     最小可行值：TopN 本就是可调系统参数，而产品只要有 1 个相似时刻就能出图
     （其相邻时次的降水窗口照常逐小时累加）。
     """
     out: Dict[str, Dict] = {}
+    single_key = (cfg.participating_keys[0]
+                  if len(cfg.participating_keys) == 1 else None)
     for t in cfg.times:
         ts = str(t)
+        if single_key is not None:
+            out[ts] = _combine_single(cfg, ranking, ts, single_key)
+            continue
         # 每个候选日期在交集组各要素中的位次（该要素未收录此日期则不计）
         per_date: Dict[str, Dict[str, int]] = {}
         for key in cfg.inter_group:
@@ -925,13 +954,18 @@ def _self_check() -> None:
     comb = _combine(cfg, ranking)
     best = hist_dates[5].isoformat()
     assert best in comb["0"]["final"]
-    assert comb["0"]["source"][best] == "1 要素交集"
-    # 收紧 TopN 后，只有真正排进前 3 的样本才进交集（final 按日期排序）
+    # 单要素：不做交集，直接采用该要素 TopN 榜单
+    assert comb["0"]["single_element"]
+    assert "不做交集" in comb["0"]["source"][best]
+    # 收紧 TopN 后只保留该要素排名前 3 的样本（保持相似度顺序）
     tight = _combine(cfg.copy(inter_topn=3), ranking)
-    assert tight["0"]["final"] == sorted(r["date"] for r in rows[:3]), \
+    assert tight["0"]["final"] == [r["date"] for r in rows[:3]], \
         tight["0"]["final"]
     assert tight["0"]["inter_topn_used"] == 3 and not tight["0"]["inter_topn_auto"]
-    # 严格交集为空时自动放宽 TopN：v925 反向排序后与 u925 无共同前三名
+    # 单要素模式不计算交集可行性：候选池 = 20 个样本剔除 ±3 天窗
+    dg = tight["0"]["diagnose"]
+    assert dg["n_candidates"] == 17 and dg["min_feasible_topn"] == 1, dg
+    assert dg["curve"] == [], dg
     feats2 = dict(feats)
     H2 = H[::-1].copy()
     feats2[("v", 925.0, 0)] = {"x": H2[15] + 0.01, "H": H2}
@@ -943,10 +977,6 @@ def _self_check() -> None:
         comb2["0"]
     # 放宽后必须真的取到样本——产品只要有 1 个相似时刻就能出图
     assert comb2["0"]["n_inter"] >= 1, comb2["0"]
-    # 诊断：单要素交集的最小可行 TopN 必为 1；候选池 = 20 个样本剔除 ±3 天窗
-    dg = tight["0"]["diagnose"]
-    assert dg["n_candidates"] == 17 and dg["min_feasible_topn"] == 1, dg
-    assert dg["curve"][0] == {"topn": 1, "n_inter": 1}, dg
     # 排除窗应剔除目标日附近
     r2 = _similarity_and_rank(cfg, feats, [date(2001, 4, 20)] * 20,
                               date(2001, 4, 21), w, _noop, None)

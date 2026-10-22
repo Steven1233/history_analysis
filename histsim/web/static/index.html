@@ -127,6 +127,8 @@
               <input id="prepOut" type="text" spellcheck="false"></label>
             <label class="field"><span>起始年份</span><input id="prepYFrom" type="number" step="1"></label>
             <label class="field"><span>结束年份</span><input id="prepYTo" type="number" step="1"></label>
+            <label class="field"><span>并行进程数（留空自动）</span>
+              <input id="prepWorkers" type="number" min="1" max="32" step="1" placeholder="自动"></label>
           </div>
           <div class="chipset-block">
             <label class="chipset-label">产品分组</label>
@@ -220,34 +222,28 @@
           </div>
 
           <div class="panel span2">
-            <div class="panel-head"><h3>GMCP 累计降水目标检索（第一优先）</h3>
-              <p>直接以预处理后的北京时间累计降水场作为目标变量检索相似历史日，并统计平均/中位数/阈值概率产品。
-                每个窗口独立取 TopN；24h 两套默认同时启用。只勾选累计降水、不勾选任何 ERA5 要素即可做单要素检索。</p></div>
-            <div class="form-grid">
-              <label class="field checkbox span2"><label><input id="cfgPrecipEnabled" type="checkbox">启用 GMCP 累计降水目标检索</label></label>
-            </div>
+            <div class="panel-head"><h3>要素 × 层次 与 组合角色</h3>
+              <p><b>GMCP 累计降水</b> 作为第一要素与 ERA5 要素并列选择；只选一个要素时不做交集，
+                直接按该要素 TopN 执行完整流程。多要素时再点击变量卡切换角色：
+                <b class="tag-inter">交集组</b>（各自 TopN 后取交集）、
+                <b class="tag-direct">直取组</b>（各自 TopN 直接并入），灰色为不参与。</p></div>
             <div class="chipset-block">
-              <label class="chipset-label">累计降水窗口（北京时间）</label>
+              <label class="chipset-label">要素（GMCP 累计降水为第一要素）</label>
+              <div class="chipset" id="chipElements"></div>
+            </div>
+            <div class="chipset-block" id="precipWinBlock">
+              <label class="chipset-label">GMCP 累计降水窗口（北京时间）</label>
               <div class="chipset" id="chipPrecipWindows"></div>
             </div>
             <div class="form-grid">
-              <label class="field"><span>每个窗口相似 TopN</span>
+              <label class="field"><span>累计降水相似 TopN</span>
                 <input id="cfgPrecipTopn" type="number" min="1" step="1"></label>
-              <label class="field span2"><span>累计降水概率阈值（mm，逗号分隔）</span>
+              <label class="field"><span>累计降水概率阈值（mm，逗号分隔）</span>
                 <input id="cfgPrecipThresh" type="text" placeholder="0.1,30,50"></label>
             </div>
             <div class="hint" id="precipHint"></div>
-          </div>
-
-          <div class="panel span2">
-            <div class="panel-head"><h3>要素 × 层次 与 组合角色</h3>
-              <p>勾选要素与气压层生成变量组合，再点击变量卡片切换角色：<b class="tag-inter">交集组</b>（各自动 TopN 后取交集）、<b class="tag-direct">直取组</b>（各自 TopN 直接并入）、灰色为不参与。</p></div>
             <div class="chipset-block">
-              <label class="chipset-label">要素</label>
-              <div class="chipset" id="chipElements"></div>
-            </div>
-            <div class="chipset-block">
-              <label class="chipset-label">气压层（hPa）</label>
+              <label class="chipset-label">气压层（hPa，仅 ERA5 要素）</label>
               <div class="chipset" id="chipLevels"></div>
             </div>
             <div class="varwrap">
@@ -257,6 +253,7 @@
                 <button class="btn tiny" id="btnClearRole">全部清空角色</button>
               </div>
               <div class="chips" id="varChips"></div>
+              <div class="hint" id="varRoleHint"></div>
             </div>
             <div class="form-grid" style="margin-top:13px">
               <label class="field checkbox span2"><label><input id="cfgPlotDirect" type="checkbox">额外产出直取要素场图（单独出图，不影响交集要素场图）</label></label>

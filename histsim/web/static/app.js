@@ -46,6 +46,7 @@ const state = {
 const TASK_KEY = 'histsim.task';       // 当前任务持久化键（F5 后自动续跟踪）
 const PREP_KEY = 'histsim.preprocess'; // 当前预处理任务持久化键
 const COLLAPSE_KEY = 'histsim.collapsed';  // 配置分区折叠状态
+const PRECIP_KEY = 'gmcp_precip';      // 基本要素选择区的第一要素：GMCP 累计降水
 
 /* ── 通用工具 ─────────────────────────────────────────────────────── */
 function esc(v) {
@@ -275,6 +276,7 @@ function prepCollect() {
     year_to: Number($('#prepYTo').value),
     groups: chipValues('#prepGroups'),
     overwrite: $('#prepOverwrite').checked,
+    workers: Number($('#prepWorkers').value) || null,
   };
 }
 
@@ -287,6 +289,7 @@ async function loadPreprocess() {
       if (!$('#prepOut').value) $('#prepOut').value = d.output_root || '';
       if (!$('#prepYFrom').value) $('#prepYFrom').value = d.year_from || 2000;
       if (!$('#prepYTo').value) $('#prepYTo').value = d.year_to || 2024;
+      if (d.workers) $('#prepWorkers').placeholder = `自动（${d.workers}）`;
       chipset('#prepGroups', m.groups.map(g => g.key), k => {
         const g = m.groups.find(x => x.key === k); return g ? g.name : k;
       }, d.groups || m.groups.map(g => g.key));
@@ -462,9 +465,24 @@ function chipset(container, values, labeler, selected) {
   $$('.chip', $(container)).forEach(c => c.addEventListener('click', () => {
     c.classList.toggle('on');
     if (container === '#chipElements' || container === '#chipLevels') sync();
+    if (container === '#chipElements') syncPrecipMode();
   }));
 }
 const chipValues = sel => $$('.chip.on', $(sel)).map(c => c.dataset.value);
+
+/* 基本要素选择区：GMCP 累计降水始终作为第一要素排在最前 */
+function elementChips() {
+  return [PRECIP_KEY, ...state.meta.elements.map(e => e.key)];
+}
+function elementLabel(k) {
+  if (k === PRECIP_KEY) {
+    const p = state.meta.precip_element;
+    return p ? p.name : 'GMCP 累计降水';
+  }
+  const e = state.meta.elements.find(x => x.key === k);
+  return e ? e.name : k;
+}
+const isPrecipOn = () => chipValues('#chipElements').includes(PRECIP_KEY);
 
 async function initConfig() {
   const m = state.meta;
@@ -481,16 +499,12 @@ async function initConfig() {
   chipset('#chipMonths', [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], v => v + ' 月', [4, 5, 6]);
   initCollapse();
   chipset('#chipTimes', m.times, v => String(v).padStart(2, '0') + 'UTC', [0]);
-  chipset('#chipElements', m.elements.map(e => e.key), k => {
-    const e = m.elements.find(x => x.key === k); return e ? e.name : k;
-  }, ['u', 'v', 'rh']);
+  chipset('#chipElements', elementChips(), elementLabel,
+    [PRECIP_KEY, 'u', 'v', 'rh']);
   chipset('#chipLevels', m.levels, v => v, [925, 500]);
   chipset('#chipPrecipWindows', (m.precip_windows || []).map(p => p.key), k => {
     const p = (m.precip_windows || []).find(x => x.key === k); return p ? p.name : k;
   }, m.default_precip_windows || []);
-  $('#cfgPrecipEnabled').addEventListener('change', () => {
-    syncPrecipMode(); updateTemplateDiff();
-  });
   $('#chipPrecipWindows').addEventListener('click', () => { syncPrecipMode(); updateTemplateDiff(); });
   $('#cfgPrecipTopn').addEventListener('input', updateTemplateDiff);
   $('#cfgPrecipThresh').addEventListener('input', updateTemplateDiff);
@@ -547,20 +561,27 @@ function syncFormulaRow() {
   $('#formulaRow').hidden = $('#cfgSimilarity').value !== 'custom';
 }
 
-/* 累计降水目标检索：关闭时置灰窗口选择 */
+/* 累计降水作为第一要素：未勾选时置灰窗口选择 */
 function syncPrecipMode() {
-  const on = $('#cfgPrecipEnabled').checked;
-  const block = $('#chipPrecipWindows').closest('.chipset-block');
-  block.classList.toggle('disabled', !on);
+  const on = isPrecipOn();
+  $('#precipWinBlock').classList.toggle('disabled', !on);
   $('#chipPrecipWindows').classList.toggle('disabled', !on);
   $('#cfgPrecipTopn').disabled = !on;
   $('#cfgPrecipThresh').disabled = !on;
   const picked = chipValues('#chipPrecipWindows');
-  $('#precipHint').innerHTML = on
-    ? (picked.length
-      ? `已选 ${picked.length} 个窗口；每个窗口独立检索 TopN，并生成平均/中位数/≥阈值概率产品。`
-      : '已启用但未选择窗口：请至少勾选一个累计降水窗口。')
-    : '未启用累计降水目标检索：仅使用 ERA5 要素。';
+  const era5 = chipValues('#chipElements').filter(k => k !== PRECIP_KEY);
+  let hint;
+  if (!on) {
+    hint = era5.length
+      ? '未选累计降水：仅使用 ERA5 要素检索。'
+      : '请至少选择一个要素（GMCP 累计降水或 ERA5 要素）。';
+  } else if (!picked.length) {
+    hint = '已选 GMCP 累计降水但未选择窗口：请至少勾选一个累计降水窗口。';
+  } else {
+    hint = `已选 ${picked.length} 个窗口；每个窗口独立检索 TopN，并生成平均/中位数/≥阈值概率产品。`;
+    if (!era5.length) hint += ' <b>当前仅选累计降水：按单要素执行完整流程，不做交集。</b>';
+  }
+  $('#precipHint').innerHTML = hint;
 }
 
 /* 模板差异计数：相对内置模板默认值改了多少项 */
@@ -601,7 +622,6 @@ function applyTemplate(key) {
   $('#cfgPlotDirect').checked = !!t.plot_direct_fields;
   $('#cfgEnable24').checked = !!t.enable_24h;
   $('#cfgPartial').checked = !!t.partial_intersection;
-  $('#cfgPrecipEnabled').checked = !!t.precip_enabled;
   set('#cfgPrecipTopn', t.precip_topn);
   set('#cfgPrecipThresh', (t.precip_thresholds || []).join(','));
   const m = state.meta;
@@ -609,9 +629,8 @@ function applyTemplate(key) {
   chipset('#chipTimes', m.times, v => String(v).padStart(2, '0') + 'UTC', t.times);
   const els = [...new Set(t.variables.map(v => v[0]))];
   const lvs = [...new Set(t.variables.map(v => v[1]))];
-  chipset('#chipElements', m.elements.map(e => e.key), k => {
-    const e = m.elements.find(x => x.key === k); return e ? e.name : k;
-  }, els);
+  chipset('#chipElements', elementChips(), elementLabel,
+    [...(t.precip_enabled ? [PRECIP_KEY] : []), ...els]);
   chipset('#chipLevels', m.levels, v => v, lvs);
   chipset('#chipPrecipWindows', (m.precip_windows || []).map(p => p.key), k => {
     const p = (m.precip_windows || []).find(x => x.key === k); return p ? p.name : k;
@@ -633,10 +652,11 @@ function syncVarChips(presetVars, presetInter, presetDirect) {
       else if (presetDirect && presetDirect.includes(k)) roleOf[k] = 'direct';
     });
   }
-  const els = chipValues('#chipElements');
+  const els = chipValues('#chipElements').filter(k => k !== PRECIP_KEY);
   const lvs = chipValues('#chipLevels').map(Number);
   const next = [];
   for (const l of lvs) for (const e of els) next.push({ key: e + l, el: e, level: l, role: roleOf[e + l] || '' });
+  if (next.length === 1 && !next[0].role) next[0].role = 'inter';  // 单要素默认走完整流程
   state.vars = next;
   renderVarChips();
 }
@@ -644,17 +664,28 @@ function syncVarChips(presetVars, presetInter, presetDirect) {
 function renderVarChips() {
   const m = state.meta;
   const elName = k => { const e = m.elements.find(x => x.key === k); return e ? e.name : k; };
-  $('#varCount').textContent = state.vars.length;
-  $('#varChips').innerHTML = state.vars.length ? state.vars.map((v, i) =>
+  const precipOn = isPrecipOn();
+  $('#varCount').textContent = state.vars.length + (precipOn ? 1 : 0);
+  const precipChip = precipOn
+    ? `<span class="vchip role-inter" title="独立完整检索流程：以累计降水场为目标变量，不参与交集">
+        <span class="dot"></span>GMCP 累计降水 <b>第一要素</b></span>`
+    : '';
+  const roleChips = state.vars.map((v, i) =>
     `<button class="vchip ${v.role ? 'role-' + v.role : ''}" data-i="${i}"
       title="点击切换：不参与 → 交集组 → 直取组">
-      <span class="dot"></span>${esc(elName(v.el))} <b>${v.level}</b></button>`).join('')
-    : '<div class="empty" style="padding:12px">请先勾选要素与气压层。</div>';
-  $$('#varChips .vchip').forEach(b => b.addEventListener('click', () => {
+      <span class="dot"></span>${esc(elName(v.el))} <b>${v.level}</b></button>`).join('');
+  $('#varChips').innerHTML = (precipChip + roleChips)
+    || '<div class="empty" style="padding:12px">请先勾选要素与气压层。</div>';
+  $$('#varChips .vchip[data-i]').forEach(b => b.addEventListener('click', () => {
     const v = state.vars[Number(b.dataset.i)];
     v.role = v.role === '' ? 'inter' : v.role === 'inter' ? 'direct' : '';
     renderVarChips();
   }));
+  $('#varRoleHint').innerHTML = (state.vars.length === 1 && !precipOn)
+    ? '仅一个要素：自动按该要素 TopN 执行完整流程，<b>不使用交集</b>。'
+    : (precipOn && !state.vars.length
+      ? '仅 GMCP 累计降水：按单要素执行完整流程，<b>不使用交集</b>。'
+      : '');
 }
 
 function applyRolesToGroups() { renderVarChips(); }
@@ -671,8 +702,10 @@ const parseFloats = txt => String(txt || '').split(',').map(s => Number(s.trim()
   .filter(n => !Number.isNaN(n));
 
 function collect() {
-  const inter = state.vars.filter(v => v.role === 'inter').map(v => v.key);
-  const direct = state.vars.filter(v => v.role === 'direct').map(v => v.key);
+  let inter = state.vars.filter(v => v.role === 'inter').map(v => v.key);
+  let direct = state.vars.filter(v => v.role === 'direct').map(v => v.key);
+  // 单一要素：未指定角色时默认走完整流程（后端同样会归一化）
+  if (state.vars.length === 1 && !inter.length && !direct.length) inter = [state.vars[0].key];
   return {
     template: $('#cfgTemplate').value || null,
     name: $('#cfgName').value.trim() || '自定义配置',
@@ -702,7 +735,7 @@ function collect() {
     rain_window_24h: parseInts($('#cfgRainWin24').value),
     rain_thresholds: parseFloats($('#cfgThresh').value),
     enable_24h: $('#cfgEnable24').checked,
-    precip_enabled: $('#cfgPrecipEnabled').checked,
+    precip_enabled: isPrecipOn(),
     precip_windows: chipValues('#chipPrecipWindows'),
     precip_topn: Number($('#cfgPrecipTopn').value),
     precip_thresholds: parseFloats($('#cfgPrecipThresh').value),
@@ -724,9 +757,9 @@ function cfgGuard() {
   const c = collect();
   const hasPrecip = c.precip_enabled && c.precip_windows.length;
   if (!c.target_date) return { id: 'cfgDate', msg: '请选择目标日期（同期模式为必填）' };
-  if (!c.variables.length && !hasPrecip) return { id: 'chipElements', msg: '请至少勾选一个 ERA5 要素，或启用 GMCP 累计降水目标检索' };
-  if (!c.inter_group.length && !c.direct_group.length && !hasPrecip) return { id: 'varChips', msg: '请为变量指定交集组或直取组（点击变量卡片切换角色）' };
-  if (c.precip_enabled && !c.precip_windows.length) return { id: 'chipPrecipWindows', msg: '已启用累计降水检索，请至少勾选一个窗口' };
+  if (!c.variables.length && !hasPrecip) return { id: 'chipElements', msg: '请至少勾选一个要素（GMCP 累计降水为第一要素，也可选 ERA5 要素）' };
+  if (!c.inter_group.length && !c.direct_group.length && !hasPrecip) return { id: 'varChips', msg: '请为变量指定交集组或直取组（单一要素会自动执行完整流程）' };
+  if (c.precip_enabled && !c.precip_windows.length) return { id: 'chipPrecipWindows', msg: '已勾选 GMCP 累计降水，请至少选择一个窗口' };
   if (c.precip_enabled && !c.precip_thresholds.length) return { id: 'cfgPrecipThresh', msg: '请填写累计降水概率阈值' };
   if (c.sample_mode === 'calendar' && !c.months.length) return { id: 'chipMonths', msg: '请至少选择一个月份' };
   if (!c.times.length) return { id: 'chipTimes', msg: '请至少选择一个检索时次' };
@@ -1134,6 +1167,11 @@ function cfgVars(cfg) {
     return `${names[e] || e} ${l}hPa（${role}）`;
   }).join('、') || '—';
 }
+function cfgSingleTarget(cfg) {
+  const keys = [...(cfg.inter_group || []), ...(cfg.direct_group || [])]
+    .filter((v, i, a) => a.indexOf(v) === i);
+  return keys.length === 1;
+}
 function cfgWeight(cfg) {
   if (cfg.weight_mode === 'gauss') return `高斯衰减（r0 = ${cfg.gauss_r0_km} km）`;
   const z = (cfg.zones || []).map(([d, w]) => `≤${d}km→${w}`).join('，');
@@ -1166,6 +1204,8 @@ function renderConfigPanel(cfg, targetDate) {
     ['排除窗', `目标日前后 ${cfg.exclude_days} 天`],
     ['交集组', `${(cfg.inter_group || []).join(', ') || '—'} · TopN ${cfg.inter_topn}`],
     ['直取组', `${(cfg.direct_group || []).join(', ') || '—'} · TopN ${cfg.direct_topn}`],
+    ['组合方式', cfgSingleTarget(cfg) ? '单要素（不做交集，直接 TopN 完整流程）'
+      : (cfg.partial_intersection ? '部分交集 + 直取' : '严格交集 + 直取')],
     ['部分交集', cfg.partial_intersection ? `开启（命中 ≥ ${cfg.partial_min_hits}）` : '关闭'],
     ['直取要素场单独出图', cfg.plot_direct_fields ? '是' : '否'],
     ['GMCP 累计降水检索', cfg.precip_enabled

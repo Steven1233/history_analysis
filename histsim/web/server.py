@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .. import __version__
 from ..api import SearchSession
-from ..config import BUILTIN_KEYS, ELEMENTS
+from ..config import BUILTIN_KEYS, ELEMENTS, PRECIP_ELEMENT_KEY
 from ..precip import PRECIP_PRODUCTS
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -89,6 +89,9 @@ def _meta(s: SearchSession, q, b):
         "data_dir": s.store.data_dir,
         "elements": [{"key": k, "name": v[2], "units": v[3], "nc_var": v[1],
                       "file_element": v[0]} for k, v in ELEMENTS.items()],
+        # 基本要素选择区的第一要素：GMCP 累计降水（无气压层，独立完整检索流程）
+        "precip_element": {"key": PRECIP_ELEMENT_KEY, "name": "GMCP 累计降水",
+                           "first": True, "no_level": True},
         "precip_windows": [{"key": k, "name": p.label(), "group": p.group,
                             "duration_h": p.duration_h, "folder": p.folder}
                            for k, p in PRECIP_PRODUCTS.items()],

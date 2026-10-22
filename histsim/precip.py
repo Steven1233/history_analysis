@@ -24,6 +24,7 @@ from __future__ import annotations
 import calendar
 import os
 import re
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -255,13 +256,96 @@ def _write_product(path: str, acc: np.ndarray, lat: np.ndarray, lon: np.ndarray,
     os.replace(tmp, path)
 
 
+# 并行参数：以「日」为分发单位（同一天内多产品共享小时读取），主进程只做汇总
+MAX_WORKERS = 8
+_WORKER_MEMORY_BUDGET = 1_500_000_000  # 约 1.5 GB，按单日累加量估算并行度
+
+
+def _default_workers(shape: Tuple[int, int], n_products: int) -> int:
+    """按 CPU 核数与单日内存占用确定默认并行进程数。"""
+    cpu = os.cpu_count() or 2
+    per_day = max(1, int(shape[0]) * int(shape[1]) * 4 * max(1, n_products))
+    cap = max(1, int(_WORKER_MEMORY_BUDGET // (per_day * 2)))  # 累加器 + 单小时场
+    return max(1, min(cpu, MAX_WORKERS, cap))
+
+
+def _process_day(task: Tuple) -> Dict:
+    """进程池任务：累加并写出某一天的所有待生成产品。
+
+    必须在模块级定义（Windows spawn 要求可 pickle）；只返回统计与少量错误样例，
+    避免把大数组跨进程搬运。
+    """
+    source_root, output_root, day_iso, keys, shape = task
+    day = date.fromisoformat(day_iso)
+    stats: Dict = {"day": day_iso, "written": 0, "incomplete": 0, "errors": 0,
+                   "error_samples": []}
+
+    # 小时 -> 需要该小时的产品（跨日窗口也在此自然展开）
+    inverse: Dict[datetime, List[str]] = {}
+    for key in keys:
+        for h in PRECIP_PRODUCTS[key].hours_utc(day):
+            inverse.setdefault(h, []).append(key)
+    acc = {k: np.zeros(shape, dtype=np.float32) for k in keys}
+    missing: Dict[str, List[str]] = {k: [] for k in keys}
+    lat = lon = None
+
+    for h in sorted(inverse):
+        path = hourly_path(source_root, h)
+        if not os.path.isfile(path):
+            for k in inverse[h]:
+                missing[k].append(h.strftime("%Y%m%d%H"))
+            continue
+        try:
+            arr, hlat, hlon = _read_hour(path)
+        except Exception as exc:
+            for k in inverse[h]:
+                missing[k].append(h.strftime("%Y%m%d%H"))
+            if len(stats["error_samples"]) < 8:
+                stats["error_samples"].append(
+                    f"{os.path.basename(path)}: {type(exc).__name__}: {exc}")
+            continue
+        if arr.shape != shape:
+            for k in inverse[h]:
+                missing[k].append(h.strftime("%Y%m%d%H") + "(网格不一致)")
+            continue
+        if lat is None:
+            lat, lon = hlat, hlon
+        for k in inverse[h]:
+            acc[k] += arr
+
+    for key in keys:
+        if missing[key]:
+            stats["incomplete"] += 1
+            if len(stats["error_samples"]) < 8:
+                stats["error_samples"].append(
+                    f"{key} {day} 缺 {len(missing[key])} 小时："
+                    + ",".join(missing[key][:4]))
+            continue
+        if lat is None:
+            stats["incomplete"] += 1
+            continue
+        try:
+            _write_product(product_path(output_root, key, day), acc[key],
+                           lat, lon, PRECIP_PRODUCTS[key], day)
+            stats["written"] += 1
+        except Exception as exc:
+            stats["errors"] += 1
+            if len(stats["error_samples"]) < 8:
+                stats["error_samples"].append(
+                    f"{key} {day} 写出失败: {type(exc).__name__}: {exc}")
+    return stats
+
+
 def run_preprocess(source_root: str, output_root: str, keys: Sequence[str],
                    year_from: int, year_to: int, overwrite: bool = False,
                    progress: Callable[[str, str, int, int, str], None] = _noop,
-                   should_stop: Optional[Callable[[], bool]] = None) -> Dict:
-    """把 GMCP 逐小时降水累加为指定累计产品。
+                   should_stop: Optional[Callable[[], bool]] = None,
+                   workers: Optional[int] = None) -> Dict:
+    """把 GMCP 逐小时降水累加为指定累计产品（按日并行）。
 
-    同一天的所有产品共享一次小时读取（取窗口并集），避免同一小时文件被反复打开。
+    同一天的所有产品共享一次小时读取（取窗口并集），避免同一小时文件被反复打开；
+    不同日期之间没有共享，按「日」分发到进程池即可近似线性加速。
+    Windows 冻结态依赖入口的 ``multiprocessing.freeze_support()``。
     """
     keys = [k for k in keys if k in PRECIP_PRODUCTS]
     if not keys:
@@ -288,82 +372,84 @@ def run_preprocess(source_root: str, output_root: str, keys: Sequence[str],
     if axes is None:
         raise ValueError("源目录中没有可读的 GMCP 小时文件")
     lat, lon = axes
-    shape = (lat.size, lon.size)
+    shape = (int(lat.size), int(lon.size))
 
-    progress("run", "累加并写出累计降水产品", 0, total,
-             f"{len(days)} 天 × {len(keys)} 个产品")
+    n_workers = int(workers) if workers else _default_workers(shape, len(keys))
+    n_workers = max(1, min(n_workers, os.cpu_count() or 1, MAX_WORKERS))
 
+    # 先在主进程完成「已存在则跳过」的判定，再把待处理日期分发给进程池
+    jobs: List[Tuple] = []
     for day in days:
         if should_stop and should_stop():
             raise PreprocessCancelled("预处理已取消")
         pending = []
         for key in keys:
-            p = product_path(output_root, key, day)
-            if os.path.isfile(p) and not overwrite:
+            if os.path.isfile(product_path(output_root, key, day)) and not overwrite:
                 skipped += 1
                 done += 1
             else:
                 pending.append(key)
-        if not pending:
-            progress("run", "累加并写出累计降水产品", done, total,
-                     f"{day} 已存在，跳过")
-            continue
+        if pending:
+            jobs.append((source_root, output_root, day.isoformat(),
+                         tuple(pending), shape))
+    n_workers = max(1, min(n_workers, len(jobs))) if jobs else 1
 
-        # 小时 -> 需要该小时的产品（跨日窗口也在此自然展开）
-        inverse: Dict[datetime, List[str]] = {}
-        for key in pending:
-            for h in PRECIP_PRODUCTS[key].hours_utc(day):
-                inverse.setdefault(h, []).append(key)
-        acc = {k: np.zeros(shape, dtype=np.float32) for k in pending}
-        missing: Dict[str, List[str]] = {k: [] for k in pending}
+    progress("run", "并行累加并写出累计降水产品", done, total,
+             f"{len(days)} 天 × {len(keys)} 个产品 · {n_workers} 个并行进程"
+             + (f" · 跳过 {skipped} 个已存在产品" if skipped else ""))
 
-        for h in sorted(inverse):
+    def absorb(st: Dict) -> None:
+        nonlocal written, incomplete, errors
+        written += int(st.get("written", 0))
+        incomplete += int(st.get("incomplete", 0))
+        errors += int(st.get("errors", 0))
+        for item in st.get("error_samples") or []:
+            if len(error_samples) < 30:
+                error_samples.append(item)
+
+    if jobs and n_workers > 1:
+        ex = ProcessPoolExecutor(max_workers=n_workers)
+        cancelled = False
+        try:
+            futures = {ex.submit(_process_day, job): job for job in jobs}
+            while futures:
+                if should_stop and should_stop():
+                    cancelled = True
+                    for f in futures:
+                        f.cancel()
+                    raise PreprocessCancelled("预处理已取消")
+                finished, _ = wait(futures, timeout=0.5,
+                                   return_when=FIRST_COMPLETED)
+                for f in finished:
+                    job = futures.pop(f)
+                    try:
+                        st = f.result()
+                    except Exception as exc:  # 单个日期失败不影响整批
+                        errors += len(job[3])
+                        if len(error_samples) < 30:
+                            error_samples.append(
+                                f"{job[2]} 处理失败: {type(exc).__name__}: {exc}")
+                        st = None
+                    if st is not None:
+                        absorb(st)
+                    done += len(job[3])
+                    progress("run", "并行累加并写出累计降水产品", done, total,
+                             f"{job[2]} · 已写 {written} · 跳过 {skipped}"
+                             f" · 并行 {n_workers}")
+        finally:
+            ex.shutdown(wait=not cancelled, cancel_futures=True)
+    else:
+        for job in jobs:
             if should_stop and should_stop():
                 raise PreprocessCancelled("预处理已取消")
-            p = hourly_path(source_root, h)
-            if not os.path.isfile(p):
-                for k in inverse[h]:
-                    missing[k].append(h.strftime("%Y%m%d%H"))
-                continue
-            try:
-                arr, hlat, hlon = _read_hour(p)
-            except Exception as exc:
-                for k in inverse[h]:
-                    missing[k].append(h.strftime("%Y%m%d%H"))
-                if len(error_samples) < 30:
-                    error_samples.append(f"{os.path.basename(p)}: "
-                                         f"{type(exc).__name__}: {exc}")
-                continue
-            if arr.shape != shape:
-                for k in inverse[h]:
-                    missing[k].append(h.strftime("%Y%m%d%H") + "(网格不一致)")
-                continue
-            for k in inverse[h]:
-                acc[k] += arr
-
-        for key in pending:
-            if missing[key]:
-                incomplete += 1
-                if len(error_samples) < 30:
-                    error_samples.append(
-                        f"{key} {day} 缺 {len(missing[key])} 小时："
-                        + ",".join(missing[key][:4]))
-                continue
-            try:
-                _write_product(product_path(output_root, key, day), acc[key],
-                               lat, lon, PRECIP_PRODUCTS[key], day)
-                written += 1
-            except Exception as exc:
-                errors += 1
-                if len(error_samples) < 30:
-                    error_samples.append(f"{key} {day} 写出失败: "
-                                         f"{type(exc).__name__}: {exc}")
-        done += len(pending)
-        progress("run", "累加并写出累计降水产品", done, total,
-                 f"{day} · 已写 {written} · 跳过 {skipped}")
+            absorb(_process_day(job))
+            done += len(job[3])
+            progress("run", "并行累加并写出累计降水产品", done, total,
+                     f"{job[2]} · 已写 {written} · 跳过 {skipped}")
 
     progress("done", "预处理完成", total, total,
-             f"写出 {written} · 跳过 {skipped} · 缺测 {incomplete}")
+             f"写出 {written} · 跳过 {skipped} · 缺测 {incomplete}"
+             f" · 并行 {n_workers}")
     return {
         "source_root": source_root,
         "output_root": output_root,
@@ -376,6 +462,7 @@ def run_preprocess(source_root: str, output_root: str, keys: Sequence[str],
         "n_incomplete": incomplete,
         "n_errors": errors,
         "error_samples": error_samples,
+        "workers": n_workers,
         "axes": {"n_lat": int(lat.size), "n_lon": int(lon.size)},
     }
 

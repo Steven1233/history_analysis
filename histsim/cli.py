@@ -63,9 +63,11 @@ def cmd_preprocess(args) -> int:
 
     rep = run_preprocess(args.source_root, args.output_root, keys,
                          args.year_from, args.year_to,
-                         overwrite=args.overwrite, progress=report)
+                         overwrite=args.overwrite, progress=report,
+                         workers=args.workers)
     print(f"写出 {rep['n_written']} · 跳过 {rep['n_skipped']} · "
-          f"缺测 {rep['n_incomplete']} · 失败 {rep['n_errors']}")
+          f"缺测 {rep['n_incomplete']} · 失败 {rep['n_errors']} · "
+          f"并行 {rep['workers']} 进程")
     print(f"输出目录: {rep['output_root']}")
     if args.register:
         s = SearchSession()
@@ -494,6 +496,8 @@ def main(argv=None) -> int:
     p.add_argument("--year-from", type=int, default=2000)
     p.add_argument("--year-to", type=int, default=2024)
     p.add_argument("--overwrite", action="store_true", help="覆盖已有产品")
+    p.add_argument("--workers", type=int, default=None,
+                   help="并行进程数（默认按 CPU 核数与网格大小自动确定）")
     p.add_argument("--register", action="store_true", help="完成后自动登记为数据源")
     p.set_defaults(func=cmd_preprocess)
 

@@ -202,7 +202,7 @@ class SearchSession:
         cfg.precip_windows = [str(k) for k in (cfg.precip_windows or [])]
         cfg.precip_topn = int(cfg.precip_topn)
         cfg.precip_thresholds = [float(x) for x in (cfg.precip_thresholds or [])]
-        return cfg
+        return cfg.normalize()
 
     # ══ 地图圈选（第 5 项）════════════════════════════════════════════
     def region_map_png(self) -> bytes:
@@ -279,6 +279,8 @@ class SearchSession:
                 "output_root": os.path.join(self.store.data_dir, "preprocessed"),
                 "year_from": 2000, "year_to": 2024,
                 "groups": list(GROUPS), "overwrite": False,
+                # 留空＝按 CPU 核数与网格大小自动确定；可按需覆盖
+                "workers": min(8, os.cpu_count() or 1),
             },
         }
 
@@ -314,12 +316,19 @@ class SearchSession:
             raise ValueError("起始年份不能大于结束年份")
         if not (1900 <= y1 <= 2200 and 1900 <= y2 <= 2200):
             raise ValueError("年份超出合理范围")
+        try:
+            workers = int(raw.get("workers") or 0)
+        except (TypeError, ValueError):
+            raise ValueError("并行进程数必须是整数")
+        if workers and not (1 <= workers <= 32):
+            raise ValueError("并行进程数必须在 1 ～ 32 之间")
         return {
             "source_root": os.path.abspath(src),
             "output_root": os.path.abspath(out),
             "groups": groups, "products": keys,
             "year_from": y1, "year_to": y2,
             "overwrite": bool(raw.get("overwrite")),
+            "workers": workers or None,
         }
 
     def preprocess_start(self, raw: Dict) -> Dict:
@@ -347,7 +356,8 @@ class SearchSession:
             res = run_preprocess(p["source_root"], p["output_root"], p["products"],
                                  p["year_from"], p["year_to"],
                                  overwrite=p["overwrite"], progress=report,
-                                 should_stop=st.cancel.is_set)
+                                 should_stop=st.cancel.is_set,
+                                 workers=p.get("workers"))
             st.result = res
             st.state = "done"
             st.log.append({"t": round(time.time() - st.started_at, 1),
