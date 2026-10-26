@@ -27,9 +27,10 @@ from .readers import Grid, DEFAULT_IO_WORKERS, era5_axes, gmcp_axes, \
 Progress = Callable[[str, str, int, int, str], None]
 
 # ── V2.2.0：累计降水产品后处理 ────────────────────────────────────────
-# 固定分位数面板（P50 即中位数）与自定义百分位初值由 precip.py 统一提供；
-# 检索后允许在结果页把 TopN 调大而不重新检索：保留前 K 名的降水场缓存。
-PRECIP_RECOMPUTE_MAX = 300
+# 固定分位数面板（P50 即中位数）与自定义百分位初值由 precip.py 统一提供。
+# 检索时保留全部相似日排名；前 N 名的降水场写入缓存加速重算，超出缓存的名次
+# 在重算时按排名重新读取产品文件，因此 TopN 不再受缓存大小限制。
+PRECIP_FIELD_CACHE = 300
 # 累计降水产品直读的进程数：实测 8 进程较单进程快一个量级（HDF5 打开占主导）。
 PRECIP_IO_WORKERS = max(DEFAULT_IO_WORKERS, min(8, os.cpu_count() or 4))
 try:
@@ -47,6 +48,15 @@ def _score_workers(n_windows: int) -> int:
         env = 0
     cpu = os.cpu_count() or 2
     return max(1, min(n_windows, env or 4, max(1, cpu)))
+
+
+def _chunk_workers() -> int:
+    """单窗口内按候选样本分块的并行度（GMCP 单要素检索时启用）。"""
+    try:
+        env = int(os.environ.get("HISTSIM_PRECIP_CHUNKS", ""))
+    except ValueError:
+        env = 0
+    return max(1, min(env or 4, max(1, os.cpu_count() or 2)))
 
 
 def precip_products(top: np.ndarray, target_field: Optional[np.ndarray],
@@ -522,6 +532,29 @@ def _sim_scores(cfg: SearchConfig, X: np.ndarray, x: np.ndarray,
     return np.abs(diff) @ w_ord   # weighted_abs（默认）
 
 
+def _sim_scores_chunked(cfg: SearchConfig, X: np.ndarray, x: np.ndarray,
+                        w_ord: np.ndarray, formula_fn=None,
+                        workers: int = 1) -> np.ndarray:
+    """按候选样本行分块并行计算相似度（单窗口 GMCP 检索的并行点）。
+
+    SciPy 类度量（余弦/相关）与自定义公式都按样本独立归约，分块后拼接与整块
+    计算结果完全一致；行数较少（<512）时分块开销大于收益，直接串行。
+    """
+    n = int(X.shape[0])
+    workers = max(1, min(int(workers or 1), n // 512 or 1))
+    if workers <= 1 or n < 512:
+        return _sim_scores(cfg, X, x, w_ord, formula_fn)
+    idx = np.array_split(np.arange(n), workers)
+    out = np.empty(n, dtype=np.float64)
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix="histsim-score") as ex:
+        futs = {ex.submit(_sim_scores, cfg, X[part], x, w_ord, formula_fn): part
+                for part in idx if part.size}
+        for fut in as_completed(futs):
+            out[futs[fut]] = fut.result()
+    return out
+
+
 # ── 步骤 3–4 ──────────────────────────────────────────────────────────
 def _similarity_and_rank(cfg: SearchConfig, feats: Dict, hist_dates: List[date],
                          target: date, w_ord: np.ndarray, progress: Progress,
@@ -788,9 +821,8 @@ def _precip_search(cfg: SearchConfig, store: Store, target: date,
     formula_fn = (compile_formula(cfg.similarity_formula)
                   if cfg.similarity == "custom" else None)
     ths = sorted({float(t) for t in cfg.precip_thresholds})
-    # 保留前 K 名（不少于本次 TopN）：结果页把 TopN 调大时直接用缓存重算，
-    # 不再走相似度检索；K 上限避免结果 JSON/缓存无限膨胀。
-    keep = min(len(hist_dates), max(int(cfg.precip_topn), PRECIP_RECOMPUTE_MAX))
+    # 单窗口时按候选样本分块并行；多窗口时由窗口级线程池并行，避免嵌套过载。
+    chunk_workers = _chunk_workers() if len(usable) == 1 else 1
 
     def build_window(key: str) -> Dict:
         """单个窗口的相似度排名 + 产品统计（可在独立线程中执行）。"""
@@ -805,7 +837,7 @@ def _precip_search(cfg: SearchConfig, store: Store, target: date,
             if hi - lo > 1e-9:
                 H = (H - lo) / (hi - lo)
                 x = (x - lo) / (hi - lo)
-        si = _sim_scores(cfg, H, x, w_ord, formula_fn)
+        si = _sim_scores_chunked(cfg, H, x, w_ord, formula_fn, chunk_workers)
         si = np.where(excl_mask, np.inf, si)
         n_available = int(np.isfinite(si).sum())
         order_idx = np.argsort(si, kind="stable")
@@ -818,13 +850,13 @@ def _precip_search(cfg: SearchConfig, store: Store, target: date,
                          "si": float(si[pos]),
                          "mm": round(float(arrays[key][arr_i, i_pt, j_pt]), 2)})
             used_pos.append(arr_i)
-            if len(rows) >= keep:
-                break
         if not rows:
             return {"key": key, "empty": True, "n_available": n_available}
 
         topn = min(int(cfg.precip_topn), len(rows))
-        fields_all = arrays[key][used_pos].astype(np.float32)  # (K, nlat, nlon)
+        # 全部排名都保留；仅前 N 名的二维场进入缓存（超出部分重算时按排名回读）
+        cache_n = min(len(rows), max(topn, PRECIP_FIELD_CACHE))
+        fields_all = arrays[key][used_pos[:cache_n]].astype(np.float32)
         field_top = fields_all[:topn]
         target_field = arrays[key][target_i]
         prod, spatial = precip_products(field_top, target_field, i_pt, j_pt,
@@ -846,22 +878,28 @@ def _precip_search(cfg: SearchConfig, store: Store, target: date,
             "n_candidates": len(hist_dates),
             "n_available": n_available,
             "n_valid": topn,
-            "topn": int(cfg.precip_topn),
-            "max_topn": len(rows),
+            "topn": topn,
+            "max_topn": n_available,
+            "cached_topn": len(fields_all),
             "percentile": DEFAULT_PERCENTILE,
             "thresholds": ths,
             "ranking": rows,
             "target_file": target_paths[key],
             "target_field": target_field,
             "_fields": fields_all,
-            "_dates": [r["date"] for r in rows],
+            "_dates": [r["date"] for r in rows[:cache_n]],
+            "_rank_dates": [r["date"] for r in rows],
+            "_rank_si": np.asarray([r["si"] for r in rows], dtype=np.float64),
+            "_rank_mm": np.asarray([r["mm"] for r in rows], dtype=np.float32),
             "products": {**prod, "spatial": spatial},
         }
 
     workers = _score_workers(len(usable))
     windows: Dict[str, Dict] = {}
     done_n = 0
-    progress("precip", f"累计降水相似排名（窗口并行 ×{workers}）", 0, len(usable),
+    label_p = f"窗口并行 ×{workers}" + (f" · 分块 ×{chunk_workers}"
+                                        if chunk_workers > 1 else "")
+    progress("precip", f"累计降水相似排名（{label_p}）", 0, len(usable),
              "各窗口独立排名与统计")
     if workers <= 1 or len(usable) == 1:
         for key in usable:
@@ -881,7 +919,7 @@ def _precip_search(cfg: SearchConfig, store: Store, target: date,
             else:
                 windows[key] = win
             done_n += 1
-            progress("precip", f"累计降水相似排名（窗口并行 ×{workers}）",
+            progress("precip", f"累计降水相似排名（{label_p}）",
                      done_n, len(usable), f"{PRECIP_PRODUCTS[key].label()}")
     else:
         with ThreadPoolExecutor(max_workers=workers,
@@ -907,7 +945,7 @@ def _precip_search(cfg: SearchConfig, store: Store, target: date,
                     else:
                         windows[key] = win
                 done_n += 1
-                progress("precip", f"累计降水相似排名（窗口并行 ×{workers}）",
+                progress("precip", f"累计降水相似排名（{label_p}）",
                          done_n, len(usable),
                          f"{PRECIP_PRODUCTS[key].label()} 完成")
 
@@ -922,6 +960,7 @@ def _precip_search(cfg: SearchConfig, store: Store, target: date,
         "n_candidates": len(hist_dates),
         "n_windows": len(usable),
         "parallel_workers": workers,
+        "chunk_workers": chunk_workers,
         "io_workers": PRECIP_IO_WORKERS,
         "percentile": DEFAULT_PERCENTILE,
         "point": [cfg.point_lat, cfg.point_lon],
@@ -1123,6 +1162,21 @@ def _self_check() -> None:
     z = np.zeros((1, 9))
     assert np.isinf(_sim_scores(cfg.copy(similarity="cosine"), z, x, w)[0])
     assert np.isinf(_sim_scores(cfg.copy(similarity="correlation"), z, x, w)[0])
+    # ── V2.2.0：单窗口分块并行与整块计算必须一致 ────────────────────
+    Xb = np.random.default_rng(7).random((1200, 9)).astype(np.float32)
+    xb = Xb[42] + 0.01
+    for sim in ("weighted_abs", "weighted_sq", "euclidean", "cosine", "correlation"):
+        full = _sim_scores(cfg.copy(similarity=sim), Xb, xb, w)
+        part = _sim_scores_chunked(cfg.copy(similarity=sim), Xb, xb, w, None, 4)
+        assert np.allclose(full, part), sim
+    full = _sim_scores(cfg.copy(similarity="custom"), Xb, xb, w,
+                       compile_formula("sqrt(sum(w*d*d))"))
+    part = _sim_scores_chunked(cfg.copy(similarity="custom"), Xb, xb, w,
+                               compile_formula("sqrt(sum(w*d*d))"), 4)
+    assert np.allclose(full, part)
+    assert np.allclose(_sim_scores_chunked(cfg, Xb, xb, w, None, 1),
+                       _sim_scores(cfg, Xb, xb, w))
+    assert _chunk_workers() >= 1
     # ── V2.0.0：特征处理三选一 ──────────────────────────────────────
     fields_demo = {"u": H.reshape(20, 1, 1, 9)}
     order = np.arange(9)

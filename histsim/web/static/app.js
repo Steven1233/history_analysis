@@ -1253,7 +1253,9 @@ function renderPrecipPanel(r) {
   }
   const wins = Object.entries(P.windows || {});
   const maxTopn = Math.max(1, Math.min(...wins.map(([, w]) =>
-    Number(w.max_topn || w.topn || 1))));
+    Number(w.max_topn || w.n_available || w.topn || 1))));
+  const cachedTopn = Math.max(0, Math.min(...wins.map(([, w]) =>
+    Number(w.cached_topn || 0))));
   const curTopn = Number((P.recompute && P.recompute.topn) || wins[0][1].topn || 1);
   const pctl = Number(P.percentile ?? (P.recompute && P.recompute.percentile) ?? 90);
   const pc = fmtPctl(pctl);
@@ -1264,7 +1266,8 @@ function renderPrecipPanel(r) {
   const bar = `<div class="recompute-bar">
       <div class="rc-field"><label>产品 TopN（每窗相似日数）</label>
         <input id="precipTopnInput" type="number" min="1" max="${maxTopn}" step="1" value="${curTopn}">
-        <span class="rc-note">可调范围 1–${maxTopn}</span></div>
+        <span class="rc-note">可用排名 1–${maxTopn}${cachedTopn && cachedTopn < maxTopn
+          ? `（前 ${cachedTopn} 名直接取缓存，其余按排名回读产品）` : ''}</span></div>
       <div class="rc-field"><label>自定义百分位 P（%）</label>
         <div class="rc-range">
           <input id="precipPctlRange" type="range" min="1" max="99" step="1" value="${Math.round(pctl)}">
@@ -1330,7 +1333,8 @@ function renderPrecipPanel(r) {
       24 小时两套窗口为第一优先。</p></div>
     ${bar}
     <div class="hint">并行计算：窗口排名 ×${num(P.parallel_workers || 1)} ·
-      产品读取进程 ×${num(P.io_workers || 1)}（GMCP 单要素检索同样加速）</div>
+      单窗口候选分块 ×${num(P.chunk_workers || 1)} ·
+      产品读取进程 ×${num(P.io_workers || 1)}（GMCP 累计降水单要素检索同样加速）</div>
     <div class="tabs">${tabs}</div>${panes}
     ${skipped.length ? `<div class="hint" style="color:var(--warn)">跳过：${skipped.map(esc).join('；')}</div>` : ''}
   </div>`;
@@ -1518,7 +1522,9 @@ async function recomputePrecipProducts() {
     state.result = r;
     renderResult(r);
     window.scrollTo(0, y);
-    toast(`已按 TopN=${topn}、P${fmtPctl(pct)} 重算产品图（未重新检索）`, 'ok');
+    const used = Number((r.precip && r.precip.recompute && r.precip.recompute.topn) || topn);
+    toast(`已按 TopN=${used}、P${fmtPctl(pct)} 重算产品图（未重新检索）`
+      + (used < topn ? `；可用排名仅 ${used} 条，已按实际数量重算` : ''), 'ok');
   } catch (e) {
     toast('重算失败：' + e.message, 'bad');
     if (msg) {
