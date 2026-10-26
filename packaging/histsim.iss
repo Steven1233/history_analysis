@@ -1,7 +1,7 @@
 ; 历史相似检索系统 —— 安装包脚本（Inno Setup 6）
 ;
 ; 编译：  ISCC.exe packaging\histsim.iss
-; 产物：  packaging\installer\Histsim_Setup_v2.1.0.exe
+; 产物：  packaging\installer\Histsim_Setup_v2.2.0.exe
 ;
 ; 设计取舍：
 ; * 只打包 PyInstaller 的 onedir 产物（dist\Histsim），不做 onefile；
@@ -12,7 +12,7 @@
 
 #define AppName "历史相似检索系统"
 #define AppNameEn "Histsim"
-#define AppVersion "2.1.0"
+#define AppVersion "2.2.0"
 
 [Setup]
 AppId={{8F3A61C4-7B2E-4E5D-9C1A-2D6E5F0B4A73}

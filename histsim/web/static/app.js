@@ -1142,14 +1142,26 @@ async function loadResult(taskId) {
   }
 }
 
-/* 图表排序权重：field_* → field_direct_* → rain_bars → spatial_* */
+/* 图表排序权重：precip_* → precip_quantile_* → field_* → field_direct_*
+   → rain_bars → spatial_* */
 function figRank(k) {
+  if (k.startsWith('precip_quantile_')) return 1;
   if (k.startsWith('precip_')) return 0;
-  if (k.startsWith('field_direct_')) return 2;
-  if (k.startsWith('field_')) return 1;
-  if (k.startsWith('rain_bars')) return 3;
-  if (k.startsWith('spatial_')) return 4;
-  return 5;
+  if (k.startsWith('field_direct_')) return 3;
+  if (k.startsWith('field_')) return 2;
+  if (k.startsWith('rain_bars')) return 4;
+  if (k.startsWith('spatial_')) return 5;
+  return 6;
+}
+
+function figLabel(k) {
+  if (k.startsWith('precip_quantile_')) return '累计降水分位数产品图';
+  if (k.startsWith('precip_')) return '累计降水相似产品图';
+  if (k.startsWith('field_direct_')) return '直取要素场图';
+  if (k.startsWith('field_')) return '要素场对比图';
+  if (k === 'rain_bars') return '降水统计图';
+  if (k.startsWith('spatial_')) return '降水概率空间分布图';
+  return k;
 }
 
 /* ── 检索配置回放：把随结果落盘的 config 原样铺开（结果里的 config 最可靠）── */
@@ -1222,7 +1234,12 @@ function renderConfigPanel(cfg, targetDate) {
     <div class="cfg-grid">${cells}</div></div>`;
 }
 
-/* ── GMCP 累计降水目标检索产品（第一优先） ─────────────────────── */
+/* ── GMCP 累计降水目标检索产品（第一优先，V2.2.0 可后处理重算） ── */
+function fmtPctl(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? (Math.abs(n - Math.round(n)) < 1e-9 ? String(Math.round(n)) : n.toFixed(1)) : '—';
+}
+
 function renderPrecipPanel(r) {
   const P = r.precip || {};
   if (!P.enabled) return '';
@@ -1235,13 +1252,40 @@ function renderPrecipPanel(r) {
       <br>请先在「数据预处理」页生成产品，并点击「登记预处理产物」。</div></div>`;
   }
   const wins = Object.entries(P.windows || {});
+  const maxTopn = Math.max(1, Math.min(...wins.map(([, w]) =>
+    Number(w.max_topn || w.topn || 1))));
+  const curTopn = Number((P.recompute && P.recompute.topn) || wins[0][1].topn || 1);
+  const pctl = Number(P.percentile ?? (P.recompute && P.recompute.percentile) ?? 90);
+  const pc = fmtPctl(pctl);
+  const rc = P.recompute;
+  const rcNote = rc
+    ? `已按 TopN ${num(rc.topn)} · P${fmtPctl(rc.percentile)} 重算（${esc(String(rc.at || '').replace('T', ' '))}，未重新检索）`
+    : `检索结果已就绪：改 TopN 或百分位后直接重算产品图，不重新走检索流程`;
+  const bar = `<div class="recompute-bar">
+      <div class="rc-field"><label>产品 TopN（每窗相似日数）</label>
+        <input id="precipTopnInput" type="number" min="1" max="${maxTopn}" step="1" value="${curTopn}">
+        <span class="rc-note">可调范围 1–${maxTopn}</span></div>
+      <div class="rc-field"><label>自定义百分位 P（%）</label>
+        <div class="rc-range">
+          <input id="precipPctlRange" type="range" min="1" max="99" step="1" value="${Math.round(pctl)}">
+          <input id="precipPctlInput" type="number" min="1" max="99" step="1" value="${pctl}">
+        </div><span class="rc-note">拖动滑块即时重算分位数产品</span></div>
+      <button class="btn primary" id="btnPrecipRecompute">重算产品图</button>
+      <span class="rc-status" id="precipRecomputeMsg">${rcNote}</span>
+    </div>`;
   const tabs = wins.map(([k, w], i) =>
     `<button class="tab ${i ? '' : 'active'}" data-tab="q${i}">${esc(w.label || k)}（${num(w.n_valid)}）</button>`).join('');
   const panes = wins.map(([k, w], i) => {
     const p = w.products || {};
+    const q = p.quantiles || {};
     const thRows = Object.entries(p.stats || {}).map(([th, v]) =>
       `<tr><td class="mono">≥ ${esc(th)} mm</td><td class="num">${pct(v.prob)}</td>
        <td class="num">${num(v.count)} / ${num(v.n)}</td></tr>`).join('');
+    const qHeads = ['10', '25', '50', '75', '90'].map(x => `<th class="num">P${x}</th>`).join('') +
+      `<th class="num" style="color:var(--amber)">P${pc}</th>`;
+    const qVals = ['10', '25', '50', '75', '90'].map(x =>
+      `<td class="num">${q[x] == null ? '—' : q[x]}</td>`).join('') +
+      `<td class="num" style="color:var(--amber)">${p.pctl_mm == null ? '—' : p.pctl_mm}</td>`;
     const rows = (w.ranking || []).slice(0, 30).map(x =>
       `<tr><td class="num">${x.rank}</td><td class="date">${esc(x.date)}</td>
        <td class="num">${Number(x.si).toFixed(4)}</td><td class="num">${x.mm}</td></tr>`).join('');
@@ -1249,29 +1293,44 @@ function renderPrecipPanel(r) {
       <div class="hint">目标产品 <code>${esc(w.file || '')}</code> ·
         北京时间 ${esc(w.start_lst || '')} → ${esc(w.end_lst || '')} ·
         候选 ${num(w.n_candidates)} · 入产品 ${num(w.n_valid)} · TopN ${num(w.topn)}
+        ${w.n_available != null ? ` · 可用排名 ${num(w.n_available)}` : ''}
         ${w.spatial_ready ? ' · 空间产品已生成' : ''}</div>
       <div class="kpis" style="margin-bottom:14px">
-        <div class="kpi accent"><div class="k-label">相似日平均累计降水</div>
-          <div class="k-value">${p.mean_mm}<small>mm</small></div><div class="k-note">统计点 ${P.point[0]}, ${P.point[1]}</div></div>
+        <div class="kpi accent"><div class="k-label">目标日实况累计降水</div>
+          <div class="k-value">${p.target_mm == null ? '—' : p.target_mm}<small>mm</small></div>
+          <div class="k-note">目标 ${esc(r.target_date)} · 同窗口对比基准</div></div>
+        <div class="kpi"><div class="k-label">相似日平均</div>
+          <div class="k-value">${p.mean_mm}<small>mm</small></div><div class="k-note">n = ${num(p.n_valid)}</div></div>
         <div class="kpi"><div class="k-label">相似日中位数</div>
-          <div class="k-value">${p.median_mm}<small>mm</small></div><div class="k-note">n = ${num(p.n_valid)}</div></div>
-        <div class="kpi warn"><div class="k-label">样本内最大值</div>
-          <div class="k-value">${p.max_mm}<small>mm</small></div><div class="k-note">TopN 相似日极值</div></div>
+          <div class="k-value">${p.median_mm}<small>mm</small></div><div class="k-note">P50 分位</div></div>
+        <div class="kpi warn"><div class="k-label">自定义 P${pc} 分位</div>
+          <div class="k-value">${p.pctl_mm == null ? '—' : p.pctl_mm}<small>mm</small></div>
+          <div class="k-note">可调百分位产品</div></div>
       </div>
       <div class="grid2">
         <div><div class="section-title">阈值概率（统计点）</div>
           <div class="table-wrap"><table><thead><tr><th>阈值</th><th class="num">概率</th>
-          <th class="num">达到 / 有效</th></tr></thead><tbody>${thRows || '<tr><td colspan="3">无统计</td></tr>'}</tbody></table></div></div>
+          <th class="num">达到 / 有效</th></tr></thead><tbody>${thRows || '<tr><td colspan="3">无统计</td></tr>'}</tbody></table></div>
+          <div class="section-title" style="margin-top:14px">分位数（统计点，mm）</div>
+          <div class="table-wrap"><table><thead><tr>${qHeads}</tr></thead>
+          <tbody><tr>${qVals}</tr></tbody></table></div>
+        </div>
         <div><div class="section-title">相似历史日（按相似度名次）</div>
           <div class="table-wrap" style="max-height:320px"><table><thead><tr><th class="num">#</th>
           <th>日期</th><th class="num">相似度指数 SI</th><th class="num">点累计 mm</th></tr></thead>
           <tbody>${rows || '<tr><td colspan="4">无相似日</td></tr>'}</tbody></table></div></div>
       </div>
+      <div class="hint">产品图：首格为目标日实况，其后为相似日平均、中位数与阈值概率；
+        另有独立的分位数产品图（P10–P90 + 自定义 P${pc}）。重算只更新产品与图，不改检索排名。</div>
     </div>`;
   }).join('');
   return `<div class="panel"><div class="panel-head"><h3>GMCP 累计降水目标检索产品</h3>
-    <p>每个窗口独立检索 TopN 相似历史日，再用这些日期的同一窗口累计降水场统计平均、中位数与阈值概率。
+    <p>每个窗口独立检索 TopN 相似历史日，再用这些日期的同一窗口累计降水场统计平均、中位数、
+      固定分位数与自定义百分位产品；目标日实况场并排显示便于比对。
       24 小时两套窗口为第一优先。</p></div>
+    ${bar}
+    <div class="hint">并行计算：窗口排名 ×${num(P.parallel_workers || 1)} ·
+      产品读取进程 ×${num(P.io_workers || 1)}（GMCP 单要素检索同样加速）</div>
     <div class="tabs">${tabs}</div>${panes}
     ${skipped.length ? `<div class="hint" style="color:var(--warn)">跳过：${skipped.map(esc).join('；')}</div>` : ''}
   </div>`;
@@ -1424,7 +1483,7 @@ function renderResult(r) {
     <p>点击可放大，放大后可用 ← / → 或左右箭头切换、显示序号。场对比图为「目标日 + TopK 相似日」的要素场并置；概率图为各锚定时次的空间降水概率场。</p></div>
     ${figs.length ? `<div class="gallery">${figs.map(([name, url], i) =>
       `<figure class="fig" data-i="${i}"><img loading="lazy" src="${esc(url)}" alt="${esc(name)}">
-       <figcaption><span>${esc(name)}</span><span>${esc(url.split('/').pop())}</span></figcaption></figure>`).join('')}</div>`
+       <figcaption><span>${esc(figLabel(name))}</span><span>${esc(url.split('/').pop().split('?')[0])}</span></figcaption></figure>`).join('')}</div>`
       : '<div class="empty">本次未生成图表。</div>'}
     ${Object.keys(r.figure_errors || {}).length ? `<div class="hint" style="color:var(--bad)">出图警告：${
       Object.entries(r.figure_errors).map(([k, v]) => esc(k) + ' → ' + esc(v)).join('；')}</div>` : ''}
@@ -1433,7 +1492,67 @@ function renderResult(r) {
   const body = $('#resultBody');
   body.innerHTML = boxes.join('');
   bindTabs(body);
+  bindPrecipControls();
   $$('.fig', body).forEach(f => f.addEventListener('click', () => showFig(Number(f.dataset.i))));
+}
+
+/* ── V2.2.0：结果页后处理重算（TopN / 自定义百分位），不重新检索 ── */
+async function recomputePrecipProducts() {
+  if (!state.result || state.busy) return;
+  const topnEl = $('#precipTopnInput');
+  if (!topnEl) return;
+  const task = state.result.task_id;
+  const topn = Math.max(1, Number(topnEl.value || 1));
+  const pct = Math.min(99, Math.max(1, Number($('#precipPctlInput')?.value || 90)));
+  const msg = $('#precipRecomputeMsg');
+  if (msg) {
+    msg.textContent = `重算中… TopN=${topn} · P${fmtPctl(pct)}`;
+    msg.classList.add('busy');
+  }
+  const y = window.scrollY;
+  state.busy = true;
+  try {
+    const r = await post('/api/search/recompute', {
+      task_id: task, precip_topn: topn, percentile: pct,
+    });
+    state.result = r;
+    renderResult(r);
+    window.scrollTo(0, y);
+    toast(`已按 TopN=${topn}、P${fmtPctl(pct)} 重算产品图（未重新检索）`, 'ok');
+  } catch (e) {
+    toast('重算失败：' + e.message, 'bad');
+    if (msg) {
+      msg.textContent = '重算失败：' + e.message;
+      msg.classList.remove('busy');
+    }
+  } finally {
+    state.busy = false;
+  }
+}
+
+function bindPrecipControls() {
+  const topnEl = $('#precipTopnInput');
+  if (!topnEl) return;
+  const range = $('#precipPctlRange');
+  const pnum = $('#precipPctlInput');
+  let timer = null;
+  const schedule = () => {
+    clearTimeout(timer);
+    timer = setTimeout(recomputePrecipProducts, 500);
+  };
+  const sync = (src, dst) => {
+    const v = Math.min(99, Math.max(1, Number(src.value) || 1));
+    src.value = v;
+    dst.value = v;
+    schedule();
+  };
+  range.addEventListener('input', () => sync(range, pnum));
+  pnum.addEventListener('input', () => sync(pnum, range));
+  topnEl.addEventListener('change', schedule);
+  $('#btnPrecipRecompute').addEventListener('click', () => {
+    clearTimeout(timer);
+    recomputePrecipProducts();
+  });
 }
 
 function bindTabs(root) {
@@ -1475,6 +1594,22 @@ $('#btnExport').addEventListener('click', () => {
   a.click();
   URL.revokeObjectURL(a.href);
   toast('已导出结果 JSON', 'ok');
+});
+
+$('#btnExportZip').addEventListener('click', async () => {
+  if (!state.result) { toast('请先载入结果', 'bad'); return; }
+  try {
+    const r = await post('/api/search/export', { task_id: state.result.task_id });
+    const a = document.createElement('a');
+    a.href = r.url;
+    a.download = r.filename || 'histsim_export.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    toast(`已导出结果包：${r.n_figures} 张图 + result.json + 排名 CSV`, 'ok');
+  } catch (e) {
+    toast('导出失败：' + e.message, 'bad');
+  }
 });
 
 /* ══════════════════════════ 6 · 操作记录 ══════════════════════════ */

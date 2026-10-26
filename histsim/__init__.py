@@ -6,7 +6,7 @@
 
 这里用惰性导入（PEP 562），使各子模块可独立自检而不必先构建完整包。
 """
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 __all__ = ["SearchSession", "__version__"]
 

@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -18,15 +19,20 @@ import threading
 import time
 import traceback
 import uuid
+import zipfile
 from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional
+
+import numpy as np
 
 from . import config as cfgmod
 from .config import ELEMENTS, SearchConfig, builtin_template
 from .datasource import Store, discover_and_register
-from .engine import Cancelled, run_search
+from .engine import DEFAULT_PERCENTILE, PRECIP_IO_WORKERS, Cancelled, precip_products, \
+    run_search
 from .precip import DEFAULT_WINDOWS, GROUPS, PRECIP_PRODUCTS, PreprocessCancelled, \
     run_preprocess, scan_source
+from .readers import nearest_slice, precip_axes, read_precip_batch, read_precip_region
 
 # 界面默认展示的排名条数（后端仍按 TopN 全量计算）
 RANK_VIEW_LIMIT = 80
@@ -38,6 +44,39 @@ RESULT_FILE = "result.json"
 def _save_result(out_dir: str, view: Dict) -> None:
     with open(os.path.join(out_dir, RESULT_FILE), "w", encoding="utf-8") as fh:
         json.dump(view, fh, ensure_ascii=False, default=str)
+
+
+PRECIP_CACHE_FILE = "precip_cache.npz"
+
+
+def _save_precip_cache(out_dir: str, res: Dict) -> None:
+    """把各窗口前 K 名的降水场落盘，供结果页改 TopN/百分位时直接重算。
+
+    不落盘的话，重算就得重新读取产品文件；缓存只含 TopN 上限内的二维场，
+    单个窗口约 300×网格点数×4 字节，量级与一张产品图相当。
+    """
+    precip = res.get("precip") or {}
+    windows = precip.get("windows") or {}
+    if not windows:
+        return
+    payload: Dict[str, np.ndarray] = {
+        "lat": np.asarray(precip.get("_lat"), dtype=np.float64),
+        "lon": np.asarray(precip.get("_lon"), dtype=np.float64),
+    }
+    for key, win in windows.items():
+        fields = win.get("_fields")
+        if fields is None:
+            continue
+        payload[f"{key}__fields"] = np.asarray(fields, dtype=np.float32)
+        payload[f"{key}__target"] = np.asarray(win.get("target_field"),
+                                               dtype=np.float32)
+        payload[f"{key}__dates"] = np.asarray(win.get("_dates") or [], dtype="U10")
+    if len(payload) <= 2:
+        return
+    try:
+        np.savez_compressed(os.path.join(out_dir, PRECIP_CACHE_FILE), **payload)
+    except OSError:
+        pass  # 缓存写失败不影响检索主流程，重算退回直读产品文件
 
 
 class TaskState:
@@ -437,6 +476,7 @@ class SearchSession:
         try:
             res = run_search(st.cfg, self.store, progress=report,
                              should_stop=st.cancel.is_set, out_dir=st.out_dir)
+            _save_precip_cache(st.out_dir, res)
             st.result = _result_view(st, res)
             _save_result(st.out_dir, st.result)
             st.state = "done"
@@ -506,6 +546,222 @@ class SearchSession:
         with open(path, encoding="utf-8") as fh:
             return {"ok": True, "state": "done", **json.load(fh)}
 
+    def _view_of(self, task_id: str) -> tuple:
+        """取任务结果视图：本会话直接复用内存对象，历史任务从 result.json 回读。"""
+        st = self._tasks.get(task_id)
+        if st is not None:
+            if st.state == "running":
+                raise ValueError("任务仍在运行，完成后才能重算产品")
+            if st.state != "done" or st.result is None:
+                raise ValueError(f"任务状态为 {st.state}，没有可重算的结果")
+            return st, copy.deepcopy(st.result)
+        view = self._result_from_disk(task_id)
+        view.pop("ok", None)
+        view.pop("state", None)
+        return None, view
+
+    # ══ 结果后处理：改 TopN / 百分位重算，不重新检索（V2.2.0）════════
+    def recompute(self, raw: Optional[Dict]) -> Dict:
+        raw = dict(raw or {})
+        task_id = str(raw.get("task_id") or "").strip()
+        if not task_id:
+            raise ValueError("缺少 task_id")
+        st, view = self._view_of(task_id)
+        P = view.get("precip") or {}
+        windows = P.get("windows") or {}
+        if not windows:
+            raise ValueError("该结果没有 GMCP 累计降水产品，无法重算")
+
+        cur_topn = int(next(iter(windows.values())).get("topn") or 1)
+        max_topn = min(int(w.get("max_topn") or len(w.get("ranking") or []))
+                       for w in windows.values())
+        if max_topn < 1:
+            raise ValueError("该结果没有可用于重算的相似日排名")
+        try:
+            topn = int(raw.get("precip_topn") or cur_topn)
+        except (TypeError, ValueError):
+            raise ValueError("TopN 必须是整数")
+        if not 1 <= topn <= max_topn:
+            raise ValueError(f"TopN 必须在 1 ～ {max_topn} 之间（上限由检索时保留的缓存决定）")
+        try:
+            pct = float(raw.get("percentile")
+                        if raw.get("percentile") is not None
+                        else P.get("percentile", DEFAULT_PERCENTILE))
+        except (TypeError, ValueError):
+            raise ValueError("百分位必须是数字")
+        if not 1 <= pct <= 99:
+            raise ValueError("百分位必须在 1 ～ 99 之间")
+
+        cfg = SearchConfig.from_dict(view.get("config") or {})
+        target = date.fromisoformat(str(view.get("target_date"))[:10])
+        task_dir = os.path.join(self.store.results_dir, task_id)
+        cache: Dict[str, np.ndarray] = {}
+        cache_path = os.path.join(task_dir, PRECIP_CACHE_FILE)
+        if os.path.isfile(cache_path):
+            try:
+                with np.load(cache_path) as z:
+                    cache = {k: z[k] for k in z.files}
+            except (OSError, ValueError):
+                cache = {}
+
+        fig_paths: Dict[str, str] = {}
+        errors: Dict[str, str] = {}
+        figures_now = view.get("figures") or {}
+        for key, w in list(windows.items()):
+            # 只改百分位时主产品图（目标/平均/中位数/概率）不变，跳过重绘
+            redraw_main = (topn != int(w.get("topn") or 0)
+                           or f"precip_{key}" not in figures_now)
+            try:
+                updated, paths = self._recompute_window(
+                    cfg, target, task_dir, key, w, topn, pct, cache,
+                    redraw_main=redraw_main)
+            except Exception as exc:  # 单窗口失败不中断其余窗口
+                errors[f"error_precip_{key}"] = f"{type(exc).__name__}: {exc}"
+                continue
+            windows[key] = updated
+            fig_paths.update(paths)
+
+        if not fig_paths and errors:
+            raise ValueError("重算失败：" + "；".join(errors.values()))
+
+        version = int(time.time())
+        figures = view.get("figures") or {}
+        for name, path in fig_paths.items():
+            figures[name] = (f"/results/{task_id}/{os.path.basename(path)}"
+                             f"?v={version}")
+        view["figures"] = figures
+        fig_errors = view.get("figure_errors") or {}
+        for name in list(fig_errors):
+            if name.startswith("error_precip_"):
+                fig_errors.pop(name, None)
+        fig_errors.update(errors)
+        view["figure_errors"] = fig_errors
+        P["percentile"] = pct
+        P["recompute"] = {"topn": topn, "percentile": pct,
+                          "at": datetime.now().isoformat(timespec="seconds")}
+        view["precip"] = P
+        _save_result(task_dir, view)
+        if st is not None:
+            st.result = view
+        self.store.log("结果重算", task_id,
+                       f"TopN={topn} · P{pct:g}（未重新检索）", "成功")
+        return {"ok": True, **view}
+
+    def _recompute_window(self, cfg: SearchConfig, target: date,
+                          task_dir: str, key: str, w: Dict, topn: int,
+                          pct: float, cache: Dict[str, np.ndarray],
+                          redraw_main: bool = True):
+        """单个窗口的产品重算：优先用检索缓存，旧结果退回直读产品文件。"""
+        n = topn
+        ranking = list(w.get("ranking") or [])
+        if f"{key}__fields" in cache:
+            fields_all = np.asarray(cache[f"{key}__fields"], dtype=np.float32)
+            target_field = np.asarray(cache[f"{key}__target"], dtype=np.float32)
+            lat = np.asarray(cache["lat"], dtype=np.float64)
+            lon = np.asarray(cache["lon"], dtype=np.float64)
+            n = min(n, len(fields_all))
+            top = fields_all[:n]
+        else:
+            # 旧版本结果没有 npz 缓存：按排名直读目标日与相似日产品
+            target_path = self.store.find_precip(key, target)
+            if target_path is None:
+                raise ValueError(f"{PRECIP_PRODUCTS[key].label()} 目标日产品缺失")
+            lat_full, lon_full = precip_axes(target_path)
+            lat_lo = cfg.center_lat - cfg.half_span_deg
+            lat_hi = cfg.center_lat + cfg.half_span_deg
+            lon_lo = cfg.center_lon - cfg.half_span_deg
+            lon_hi = cfg.center_lon + cfg.half_span_deg
+            lat = lat_full[nearest_slice(lat_full, lat_lo, lat_hi)]
+            lon = lon_full[nearest_slice(lon_full, lon_lo, lon_hi)]
+            target_field, _, _ = read_precip_region(target_path, lat_lo, lat_hi,
+                                                    lon_lo, lon_hi)
+            ranking = ranking[:n]
+            jobs, found = [], []
+            for row in ranking:
+                p = self.store.find_precip(key, date.fromisoformat(row["date"]))
+                if p:
+                    jobs.append((p, lat_lo, lat_hi, lon_lo, lon_hi))
+                    found.append(p)
+            got = read_precip_batch(jobs, workers=PRECIP_IO_WORKERS)
+            fields = [got[p] for p in found if p in got]
+            if not fields:
+                raise ValueError("没有可读取的相似日产品文件，无法重算")
+            ranking = [row for row in ranking
+                       if self.store.find_precip(key, date.fromisoformat(row["date"]))
+                       in got]
+            top = np.stack(fields).astype(np.float32)
+            n = len(top)
+
+        i_pt = int(np.argmin(np.abs(lat - cfg.point_lat)))
+        j_pt = int(np.argmin(np.abs(lon - cfg.point_lon)))
+        ths = sorted({float(t) for t in (w.get("thresholds") or [])})
+        prod, spatial = precip_products(top, target_field, i_pt, j_pt, ths, pct)
+        prod["samples"] = [{"date": r["date"], "mm": r["mm"]}
+                           for r in sorted(ranking[:n], key=lambda r: -r["mm"])]
+
+        win = dict(w)
+        win.update({
+            "topn": int(n),
+            "n_valid": int(n),
+            "percentile": float(pct),
+            "products": prod,
+            "target_field": target_field,
+            "spatial_ready": True,
+            # 旧结果没有 max_topn：以原排名长度为准，重算后仍可继续调整
+            "max_topn": max(int(w.get("max_topn") or 0),
+                            len(w.get("ranking") or []), n),
+        })
+        win["ranking"] = ranking[:n]
+        from . import viz
+        paths: Dict[str, str] = {}
+        if redraw_main:
+            p1 = viz.render_precip_product(cfg, {**win, "products": {**prod,
+                                           "spatial": spatial}}, lat, lon, task_dir)
+            if p1:
+                paths[f"precip_{key}"] = p1
+        p2 = viz.render_precip_quantile(cfg, {**win, "products": {**prod,
+                                           "spatial": spatial}}, lat, lon,
+                                       task_dir, percentile=pct)
+        if p2:
+            paths[f"precip_quantile_{key}"] = p2
+        return win, paths
+
+    # ══ 结果导出：JSON + 全部产品图 + 累计降水排名 CSV（V2.2.0）══════
+    def export(self, raw: Optional[Dict]) -> Dict:
+        raw = dict(raw or {})
+        task_id = str(raw.get("task_id") or "").strip()
+        if not task_id or os.path.basename(task_id) != task_id:
+            raise ValueError("缺少或非法的 task_id")
+        task_dir = os.path.join(self.store.results_dir, task_id)
+        if not os.path.isdir(task_dir):
+            raise KeyError(f"未知任务: {task_id}")
+        _, view = self._view_of(task_id)
+
+        lines = ["窗口,名次,日期,相似度指数SI,点累计降水(mm)"]
+        for key, w in ((view.get("precip") or {}).get("windows") or {}).items():
+            for row in w.get("ranking") or []:
+                lines.append(",".join([
+                    key, str(row.get("rank", "")), str(row.get("date", "")),
+                    f"{float(row.get('si', 0)):.6f}", str(row.get("mm", "")),
+                ]))
+        csv_text = "\ufeff" + "\n".join(lines) + "\n"
+
+        name = f"histsim_{task_id}_export.zip"
+        path = os.path.join(task_dir, name)
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("result.json",
+                       json.dumps(view, ensure_ascii=False, indent=2, default=str))
+            z.writestr("GMCP_累计降水相似排名.csv", csv_text.encode("utf-8"))
+            for fn in sorted(os.listdir(task_dir)):
+                if fn.lower().endswith(".png"):
+                    z.write(os.path.join(task_dir, fn), arcname=f"figures/{fn}")
+        self.store.log("结果导出", task_id, f"{len(view.get('figures') or {})} 张图",
+                       "成功")
+        return {"ok": True, "url": f"/results/{task_id}/{name}",
+                "filename": name, "size": os.path.getsize(path),
+                "n_figures": len([f for f in os.listdir(task_dir)
+                                  if f.lower().endswith(".png")])}
+
     def tasks(self, limit: int = 100) -> List[Dict]:
         with self._lock:
             live = {t: self._tasks[t].snapshot() for t in self._order[-20:]}
@@ -546,11 +802,16 @@ def _result_view(st: TaskState, res: Dict) -> Dict:
     src_precip = res.get("precip") or {}
     precip_windows = {}
     for key, win in (src_precip.get("windows") or {}).items():
-        w = {k: v for k, v in win.items() if k != "products"}
+        # target_field/_fields/_dates 是重算缓存，体积大且非 JSON，落盘到 npz
+        w = {k: v for k, v in win.items()
+             if k not in ("products", "target_field", "_fields", "_dates")}
         prod = dict(win.get("products") or {})
         prod.pop("spatial", None)
         w["products"] = prod
         w["spatial_ready"] = bool((win.get("products") or {}).get("spatial"))
+        # 结果页可把 TopN 调到 max_topn（受缓存上限约束），无需重新检索
+        w["max_topn"] = int(win.get("max_topn") or len(win.get("ranking") or []))
+        w["percentile"] = float(win.get("percentile", DEFAULT_PERCENTILE))
         precip_windows[key] = w
     grid = res.get("grid") or res.get("gmcp_grid") or {}
     return {
@@ -574,6 +835,11 @@ def _result_view(st: TaskState, res: Dict) -> Dict:
             "reason": src_precip.get("reason", ""),
             "skipped": src_precip.get("skipped") or [],
             "n_candidates": src_precip.get("n_candidates", 0),
+            "n_windows": src_precip.get("n_windows", 0),
+            "parallel_workers": src_precip.get("parallel_workers", 1),
+            "io_workers": src_precip.get("io_workers", 1),
+            "percentile": float(src_precip.get("percentile", DEFAULT_PERCENTILE)),
+            "recompute": src_precip.get("recompute") or {},
             "point": src_precip.get("point") or [],
             "thresholds": src_precip.get("thresholds") or [],
             "grid": src_precip.get("grid") or {},
@@ -639,6 +905,53 @@ def _self_check() -> None:
     assert b["width"] == 1000 and b["height"] > 0 and len(b["view"]) == 4
     png = s.region_map_png()
     assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 1000
+    # ── V2.2.0：结果页改 TopN / 百分位重算 + 结果包导出 ─────────────
+    tid = "20260101_000000_selftest"
+    tdir = os.path.join(s.store.results_dir, tid)
+    os.makedirs(tdir, exist_ok=True)
+    cfg_s = builtin_template("plan_A").copy(
+        target_date="2024-06-30", variables=[], inter_group=[], direct_group=[],
+        precip_windows=["24h_2020"], precip_topn=5)
+    ranking = [{"rank": i + 1, "date": f"2019-06-0{i + 1}", "si": float(i),
+                "mm": float(i)} for i in range(5)]
+    win_view = {"key": "24h_2020", "label": "24h 自检窗口", "topn": 5,
+                "n_valid": 5, "max_topn": 5, "percentile": 90.0,
+                "thresholds": [0.1, 50.0], "ranking": ranking,
+                "spatial_ready": True,
+                "products": {"n_valid": 5, "spatial": None}}
+    view = {"task_id": tid, "target_date": "2024-06-30",
+            "config": cfg_s.to_dict(), "times": [0],
+            "precip": {"enabled": True, "available": True, "windows":
+                       {"24h_2020": win_view}, "percentile": 90.0},
+            "figures": {}, "figure_errors": {}}
+    _save_result(tdir, view)
+    lat = np.linspace(22.0, 24.0, 2)
+    lon = np.linspace(112.0, 114.0, 2)
+    fields = np.arange(5 * 2 * 2, dtype=np.float32).reshape(5, 2, 2)
+    np.savez_compressed(os.path.join(tdir, PRECIP_CACHE_FILE),
+                        lat=lat, lon=lon,
+                        **{"24h_2020__fields": fields,
+                           "24h_2020__target": fields[-1] + 1,
+                           "24h_2020__dates": np.array(
+                               [r["date"] for r in ranking], dtype="U10")})
+    rc = s.recompute({"task_id": tid, "precip_topn": 3, "percentile": 60})
+    assert rc["ok"] and rc["precip"]["percentile"] == 60.0
+    assert rc["precip"]["windows"]["24h_2020"]["n_valid"] == 3
+    assert len(rc["precip"]["windows"]["24h_2020"]["ranking"]) == 3
+    assert "precip_24h_2020" in rc["figures"]
+    assert "precip_quantile_24h_2020" in rc["figures"]
+    assert rc["precip"]["windows"]["24h_2020"]["products"]["target_mm"] is not None
+    # 重算结果必须落盘，重启后读回仍是新参数
+    back = s.result(tid)
+    assert back["precip"]["recompute"]["topn"] == 3
+    exp = s.export({"task_id": tid})
+    assert exp["url"].endswith(".zip") and exp["size"] > 0
+    # TopN 超出缓存上限应明确拒绝，而不是静默截断
+    try:
+        s.recompute({"task_id": tid, "precip_topn": 6})
+        raise AssertionError("超出 max_topn 应该报错")
+    except ValueError as exc:
+        assert "TopN 必须" in str(exc), exc
     s.close()
     print("api self-check OK ->", tmp)
 

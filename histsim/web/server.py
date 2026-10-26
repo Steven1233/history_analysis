@@ -37,6 +37,7 @@ CTYPES = {
     ".css": "text/css; charset=utf-8",
     ".js": "application/javascript; charset=utf-8",
     ".json": "application/json; charset=utf-8",
+    ".zip": "application/zip",
     ".png": "image/png",
     ".svg": "image/svg+xml",
     ".ico": "image/x-icon",
@@ -215,6 +216,18 @@ def _cancel(s: SearchSession, q, b):
 @route("GET", "/api/search/result")
 def _result(s: SearchSession, q, b):
     return 200, s.result(str(_q(q, "task_id", "")))
+
+
+@route("POST", "/api/search/recompute")
+def _recompute(s: SearchSession, q, b):
+    """V2.2.0：改 TopN / 自定义百分位后重算产品图，不重新走检索。"""
+    return 200, s.recompute(b)
+
+
+@route("POST", "/api/search/export")
+def _export(s: SearchSession, q, b):
+    """V2.2.0：把 result.json、全部产品图与累计降水排名 CSV 打包下载。"""
+    return 200, s.export(b)
 
 
 @route("GET", "/api/tasks")

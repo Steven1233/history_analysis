@@ -123,6 +123,9 @@ PRECIP_PRODUCTS: Dict[str, PrecipProduct] = {
 
 # 24h 默认两套都作为目标检索（需求：24h 为第一优先）
 DEFAULT_WINDOWS: List[str] = ["24h_2020", "24h_0808"]
+# V2.2.0：分位数产品与自定义百分位（P50 即中位数）
+PRECIP_QUANTILES: Tuple[int, ...] = (10, 25, 50, 75, 90)
+DEFAULT_PERCENTILE: float = 90.0
 GROUPS: Dict[str, List[str]] = {
     "24h": [k for k, p in PRECIP_PRODUCTS.items() if p.group == "24h"],
     "12h": [k for k, p in PRECIP_PRODUCTS.items() if p.group == "12h"],

@@ -167,6 +167,35 @@ input[type=checkbox]{accent-color:var(--amber); width:14px; height:14px; cursor:
 .field.w120{width:140px}
 .hint{font-size:11.5px; color:var(--ink-mute); margin-top:11px; line-height:1.7}
 
+/* V2.2.0：结果页后处理重算条（TopN / 自定义百分位） */
+.recompute-bar{
+  display:flex; gap:16px; align-items:flex-end; flex-wrap:wrap;
+  margin:2px 0 14px; padding:11px 13px;
+  background:linear-gradient(160deg,var(--panel-2),var(--panel));
+  border:1px solid var(--line-soft); border-left:2px solid var(--amber);
+  border-radius:var(--radius);
+}
+.rc-field{display:flex; flex-direction:column; gap:5px; min-width:132px}
+.rc-field>label{font-size:10.5px; color:var(--ink-mute); letter-spacing:.4px}
+.rc-field input[type=number]{
+  width:88px; background:var(--body); border:1px solid var(--line);
+  border-radius:3px; padding:5px 8px; font-family:var(--num); font-size:13px;
+  color:var(--ink); outline:none;
+}
+.rc-field input[type=number]:focus{border-color:var(--amber);
+  box-shadow:0 0 0 2px var(--amber-glow)}
+.rc-range{display:flex; align-items:center; gap:9px}
+.rc-range input[type=range]{
+  width:150px; accent-color:var(--amber); cursor:pointer;
+}
+.rc-note{font-size:10.5px; color:var(--ink-mute)}
+.rc-status{font-size:11.5px; color:var(--ink-mute); margin-left:auto;
+  max-width:360px; text-align:right; line-height:1.6}
+.rc-status.busy{color:var(--amber)}
+@media (max-width:980px){
+  .rc-status{margin-left:0; text-align:left; max-width:none}
+}
+
 /* ── 芯片 ───────────────────────────────────────────────────────────── */
 .chipset-block{margin-top:13px}
 .chipset-label{display:block; font-size:11px; color:var(--ink-mute); margin-bottom:7px}

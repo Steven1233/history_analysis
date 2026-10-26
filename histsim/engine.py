@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -19,11 +20,85 @@ from . import viz
 from .config import ELEMENTS, SearchConfig, var_key, var_label
 from .datasource import GMCP_RE, Store, window_offsets
 from .formula import compile_formula
-from .precip import PRECIP_PRODUCTS, product_path
+from .precip import DEFAULT_PERCENTILE, PRECIP_PRODUCTS, PRECIP_QUANTILES, product_path
 from .readers import Grid, DEFAULT_IO_WORKERS, era5_axes, gmcp_axes, \
     nearest_slice, precip_axes, read_era5_batch, read_gmcp_batch, read_precip_batch
 
 Progress = Callable[[str, str, int, int, str], None]
+
+# ── V2.2.0：累计降水产品后处理 ────────────────────────────────────────
+# 固定分位数面板（P50 即中位数）与自定义百分位初值由 precip.py 统一提供；
+# 检索后允许在结果页把 TopN 调大而不重新检索：保留前 K 名的降水场缓存。
+PRECIP_RECOMPUTE_MAX = 300
+# 累计降水产品直读的进程数：实测 8 进程较单进程快一个量级（HDF5 打开占主导）。
+PRECIP_IO_WORKERS = max(DEFAULT_IO_WORKERS, min(8, os.cpu_count() or 4))
+try:
+    PRECIP_IO_WORKERS = max(1, int(os.environ.get("HISTSIM_PRECIP_IO_WORKERS",
+                                                  PRECIP_IO_WORKERS)))
+except ValueError:
+    pass
+
+
+def _score_workers(n_windows: int) -> int:
+    """窗口级并行度：numpy 计算释放 GIL，线程池即可；限制并发以控内存峰值。"""
+    try:
+        env = int(os.environ.get("HISTSIM_PRECIP_WORKERS", ""))
+    except ValueError:
+        env = 0
+    cpu = os.cpu_count() or 2
+    return max(1, min(n_windows, env or 4, max(1, cpu)))
+
+
+def precip_products(top: np.ndarray, target_field: Optional[np.ndarray],
+                    i_pt: int, j_pt: int, thresholds: List[float],
+                    percentile: float = DEFAULT_PERCENTILE) -> Tuple[Dict, Dict]:
+    """由相似日累计降水场统计产品（V2.2.0：目标日、分位数、自定义百分位）。
+
+    ``top`` 形状 ``(n, nlat, nlon)``，按相似度升序；``target_field`` 为目标日
+    同一窗口的累计降水场（用于并排对比）。返回 ``(jsonable, spatial)``：
+    jsonable 为可直接落盘的统计量，spatial 为二维场（不进入 JSON）。
+    """
+    top = np.asarray(top, dtype=np.float32)
+    n = int(top.shape[0])
+    vals = top[:, i_pt, j_pt].astype(np.float64) if n else np.zeros(0)
+    mean_f = top.mean(axis=0) if n else np.zeros(top.shape[1:], dtype=np.float32)
+    median_f = np.median(top, axis=0) if n else np.zeros_like(mean_f)
+    spatial: Dict[str, np.ndarray] = {"mean": mean_f, "median": median_f}
+    quantiles: Dict[str, float] = {}
+    for q in PRECIP_QUANTILES:
+        f = np.percentile(top, q, axis=0) if n else np.zeros_like(mean_f)
+        spatial[f"q{q}"] = np.asarray(f, dtype=np.float32)
+        quantiles[str(q)] = round(float(np.percentile(vals, q)), 2) if n else 0.0
+    pc = float(percentile)
+    custom_f = np.percentile(top, pc, axis=0) if n else np.zeros_like(mean_f)
+    spatial["custom"] = np.asarray(custom_f, dtype=np.float32)
+    if target_field is not None:
+        spatial["target"] = np.asarray(target_field, dtype=np.float32)
+
+    ths = sorted({float(t) for t in thresholds})
+    stats: Dict[str, Dict] = {}
+    for th in ths:
+        spatial[f"prob_{th}"] = (top >= th).mean(axis=0) if n else np.zeros_like(mean_f)
+        stats[str(th)] = {
+            "prob": round(float((vals >= th).mean()), 4) if n else 0.0,
+            "count": int((vals >= th).sum()),
+            "n": int(vals.size),
+        }
+    target_mm = (round(float(np.asarray(target_field)[i_pt, j_pt]), 2)
+                 if target_field is not None else None)
+    out = {
+        "n_valid": n,
+        "mean_mm": round(float(vals.mean()), 2) if n else 0.0,
+        "median_mm": round(float(np.median(vals)), 2) if n else 0.0,
+        "max_mm": round(float(vals.max()), 2) if n else 0.0,
+        "target_mm": target_mm,
+        "percentile": pc,
+        "pctl_mm": round(float(np.percentile(vals, pc)), 2) if n else 0.0,
+        "quantiles": quantiles,
+        "stats": stats,
+        "samples": [],
+    }
+    return out, spatial
 
 
 class Cancelled(RuntimeError):
@@ -141,8 +216,9 @@ def run_search(cfg: SearchConfig, store: Store, progress: Progress = _noop,
     if has_precip:
         t0 = time.time()
         precip = _precip_search(cfg, store, target, progress, should_stop)
-        precip_lat = precip.pop("_lat", None)
-        precip_lon = precip.pop("_lon", None)
+        # _lat/_lon 既供出图，也供结果页重算缓存落盘（不进入结果 JSON）
+        precip_lat = precip.get("_lat")
+        precip_lon = precip.get("_lon")
         stop_check()
         tick("累计降水检索", t0)
         if not has_era5 and precip.get("available"):
@@ -677,7 +753,7 @@ def _precip_search(cfg: SearchConfig, store: Store, target: date,
         progress("precip", "直读累计降水产品切片", done["n"], total,
                  f"{done['n']}/{total} 文件")
 
-    cache = read_precip_batch(jobs, workers=DEFAULT_IO_WORKERS, on_done=on_done,
+    cache = read_precip_batch(jobs, workers=PRECIP_IO_WORKERS, on_done=on_done,
                               should_stop=should_stop)
     arrays: Dict[str, np.ndarray] = {
         k: np.full((len(read_dates),) + shape, np.nan, dtype=np.float32)
@@ -711,10 +787,13 @@ def _precip_search(cfg: SearchConfig, store: Store, target: date,
                           for d in hist_dates], dtype=bool)
     formula_fn = (compile_formula(cfg.similarity_formula)
                   if cfg.similarity == "custom" else None)
-    windows: Dict[str, Dict] = {}
-    for ki, key in enumerate(usable, 1):
-        if should_stop and should_stop():
-            raise Cancelled("检索已取消")
+    ths = sorted({float(t) for t in cfg.precip_thresholds})
+    # 保留前 K 名（不少于本次 TopN）：结果页把 TopN 调大时直接用缓存重算，
+    # 不再走相似度检索；K 上限避免结果 JSON/缓存无限膨胀。
+    keep = min(len(hist_dates), max(int(cfg.precip_topn), PRECIP_RECOMPUTE_MAX))
+
+    def build_window(key: str) -> Dict:
+        """单个窗口的相似度排名 + 产品统计（可在独立线程中执行）。"""
         H = arrays[key][hist_idx].reshape(len(hist_idx), -1)[:, order]
         x = arrays[key][target_i].reshape(-1)[order]
         if cfg.feature_process == "standardize":
@@ -728,6 +807,7 @@ def _precip_search(cfg: SearchConfig, store: Store, target: date,
                 x = (x - lo) / (hi - lo)
         si = _sim_scores(cfg, H, x, w_ord, formula_fn)
         si = np.where(excl_mask, np.inf, si)
+        n_available = int(np.isfinite(si).sum())
         order_idx = np.argsort(si, kind="stable")
         rows, used_pos = [], []
         for rank, pos in enumerate(order_idx, 1):
@@ -738,59 +818,101 @@ def _precip_search(cfg: SearchConfig, store: Store, target: date,
                          "si": float(si[pos]),
                          "mm": round(float(arrays[key][arr_i, i_pt, j_pt]), 2)})
             used_pos.append(arr_i)
-            if len(rows) >= cfg.precip_topn:
+            if len(rows) >= keep:
                 break
         if not rows:
-            skipped.append({"key": key, "reason": f"{PRECIP_PRODUCTS[key].label()} "
-                                                   "没有可用的相似历史日"})
-            progress("precip", "累计降水相似排名", ki, len(usable),
-                     f"{PRECIP_PRODUCTS[key].label()} 无相似日")
-            continue
+            return {"key": key, "empty": True, "n_available": n_available}
 
-        top = arrays[key][used_pos]
-        vals = top[:, i_pt, j_pt].astype(np.float64)
-        mean_f = top.mean(axis=0)
-        median_f = np.median(top, axis=0)
-        ths = sorted({float(t) for t in cfg.precip_thresholds})
-        spatial = {"mean": mean_f, "median": median_f}
-        stats = {}
-        for th in ths:
-            spatial[f"prob_{th}"] = (top >= th).mean(axis=0)
-            stats[str(th)] = {
-                "prob": round(float((vals >= th).mean()), 4),
-                "count": int((vals >= th).sum()),
-                "n": int(vals.size),
-            }
-        prod = PRECIP_PRODUCTS[key]
-        start, end = prod.bounds_utc(target)
+        topn = min(int(cfg.precip_topn), len(rows))
+        fields_all = arrays[key][used_pos].astype(np.float32)  # (K, nlat, nlon)
+        field_top = fields_all[:topn]
+        target_field = arrays[key][target_i]
+        prod, spatial = precip_products(field_top, target_field, i_pt, j_pt,
+                                        ths, DEFAULT_PERCENTILE)
+        prod["samples"] = [{"date": r["date"], "mm": r["mm"]}
+                           for r in sorted(rows[:topn], key=lambda r: -r["mm"])]
+        win = PRECIP_PRODUCTS[key]
+        start, end = win.bounds_utc(target)
         lst = timedelta(hours=8)
-        windows[key] = {
+        return {
             "key": key,
-            "label": prod.label(),
-            "group": prod.group,
+            "label": win.label(),
+            "group": win.group,
             "file": os.path.basename(target_paths[key]),
             "start_utc": start.strftime("%Y-%m-%d %H:%M"),
             "end_utc": end.strftime("%Y-%m-%d %H:%M"),
             "start_lst": (start + lst).strftime("%Y-%m-%d %H:%M"),
             "end_lst": (end + lst).strftime("%Y-%m-%d %H:%M"),
             "n_candidates": len(hist_dates),
-            "n_valid": len(rows),
+            "n_available": n_available,
+            "n_valid": topn,
             "topn": int(cfg.precip_topn),
+            "max_topn": len(rows),
+            "percentile": DEFAULT_PERCENTILE,
             "thresholds": ths,
             "ranking": rows,
-            "products": {
-                "n_valid": int(vals.size),
-                "mean_mm": round(float(vals.mean()), 2),
-                "median_mm": round(float(np.median(vals)), 2),
-                "max_mm": round(float(vals.max()), 2),
-                "stats": stats,
-                "samples": [{"date": r["date"], "mm": r["mm"]}
-                            for r in sorted(rows, key=lambda r: -r["mm"])],
-                "spatial": spatial,
-            },
+            "target_file": target_paths[key],
+            "target_field": target_field,
+            "_fields": fields_all,
+            "_dates": [r["date"] for r in rows],
+            "products": {**prod, "spatial": spatial},
         }
-        progress("precip", "累计降水相似排名", ki, len(usable),
-                 f"{prod.label()} · TopN {len(rows)}")
+
+    workers = _score_workers(len(usable))
+    windows: Dict[str, Dict] = {}
+    done_n = 0
+    progress("precip", f"累计降水相似排名（窗口并行 ×{workers}）", 0, len(usable),
+             "各窗口独立排名与统计")
+    if workers <= 1 or len(usable) == 1:
+        for key in usable:
+            if should_stop and should_stop():
+                raise Cancelled("检索已取消")
+            try:
+                win = build_window(key)
+            except Exception as exc:  # 单窗口失败不中断其余窗口
+                skipped.append({"key": key, "reason":
+                                f"{PRECIP_PRODUCTS[key].label()} 计算失败："
+                                f"{type(exc).__name__}: {exc}"})
+                done_n += 1
+                continue
+            if win.get("empty"):
+                skipped.append({"key": key, "reason": f"{PRECIP_PRODUCTS[key].label()} "
+                                                       "没有可用的相似历史日"})
+            else:
+                windows[key] = win
+            done_n += 1
+            progress("precip", f"累计降水相似排名（窗口并行 ×{workers}）",
+                     done_n, len(usable), f"{PRECIP_PRODUCTS[key].label()}")
+    else:
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="histsim-precip") as ex:
+            futs = {ex.submit(build_window, key): key for key in usable}
+            for fut in as_completed(futs):
+                key = futs[fut]
+                if should_stop and should_stop():
+                    for f in futs:
+                        f.cancel()
+                    raise Cancelled("检索已取消")
+                try:
+                    win = fut.result()
+                except Exception as exc:
+                    skipped.append({"key": key, "reason":
+                                    f"{PRECIP_PRODUCTS[key].label()} 计算失败："
+                                    f"{type(exc).__name__}: {exc}"})
+                else:
+                    if win.get("empty"):
+                        skipped.append({"key": key, "reason":
+                                        f"{PRECIP_PRODUCTS[key].label()} "
+                                        "没有可用的相似历史日"})
+                    else:
+                        windows[key] = win
+                done_n += 1
+                progress("precip", f"累计降水相似排名（窗口并行 ×{workers}）",
+                         done_n, len(usable),
+                         f"{PRECIP_PRODUCTS[key].label()} 完成")
+
+    # 按配置顺序输出，避免线程完成顺序影响界面 tab 顺序
+    windows = {k: windows[k] for k in usable if k in windows}
 
     return {
         "enabled": True,
@@ -799,8 +921,11 @@ def _precip_search(cfg: SearchConfig, store: Store, target: date,
         "skipped": skipped,
         "n_candidates": len(hist_dates),
         "n_windows": len(usable),
+        "parallel_workers": workers,
+        "io_workers": PRECIP_IO_WORKERS,
+        "percentile": DEFAULT_PERCENTILE,
         "point": [cfg.point_lat, cfg.point_lon],
-        "thresholds": sorted({float(t) for t in cfg.precip_thresholds}),
+        "thresholds": ths,
         "grid": p_grid.desc(),
         "_lat": p_lat, "_lon": p_lon,
     }
@@ -1011,6 +1136,21 @@ def _self_check() -> None:
                             fields_demo, order, hist_idx, 5)
     Hn = f_nrm[("u", 925.0, 0)]["H"]
     assert abs(float(np.min(Hn))) < 1e-9 and abs(float(np.max(Hn)) - 1.0) < 1e-6
+    # ── V2.2.0：目标日 + 分位数 + 自定义百分位产品 ──────────────────
+    top = np.arange(4 * 2 * 3, dtype=np.float32).reshape(4, 2, 3)
+    target_f = top[-1] + 1.0
+    prod, spatial = precip_products(top, target_f, 0, 1, [0.1, 50.0], 80.0)
+    assert prod["n_valid"] == 4 and prod["target_mm"] == float(target_f[0, 1])
+    assert set(prod["quantiles"]) == {"10", "25", "50", "75", "90"}
+    for k in ("mean", "median", "q10", "q25", "q50", "q75", "q90",
+              "custom", "target", "prob_0.1", "prob_50.0"):
+        assert spatial[k].shape == (2, 3), k
+    assert prod["pctl_mm"] == round(float(np.percentile(top[:, 0, 1], 80.0)), 2)
+    assert prod["percentile"] == 80.0
+    # 中位数与 P50 分位场必须一致（同一口径的两种入口）
+    assert np.allclose(spatial["median"], spatial["q50"])
+    assert abs(prod["median_mm"] - prod["quantiles"]["50"]) < 1e-9
+    assert _score_workers(8) >= 1 and _score_workers(1) == 1
     print("engine self-check OK")
 
 

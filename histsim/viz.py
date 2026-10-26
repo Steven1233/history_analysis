@@ -21,6 +21,7 @@ from matplotlib.colors import BoundaryNorm
 from matplotlib.patches import Rectangle
 
 from .config import ELEMENTS, SearchConfig, split_key, var_label, var_units
+from .precip import DEFAULT_PERCENTILE, PRECIP_QUANTILES
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DengXian", "Arial"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -592,17 +593,51 @@ def render_spatial(cfg: SearchConfig, products: Dict, glat: np.ndarray,
 
 
 # ── GMCP 累计降水目标检索产品图 ────────────────────────────────────────
+def _shared_rain_scale(fields: Sequence[Optional[np.ndarray]]) -> tuple:
+    """目标日与统计产品共用一套色标，才能直接比较量级差异。"""
+    vals = []
+    for f in fields:
+        if f is None:
+            continue
+        a = np.asarray(f, dtype=np.float64)
+        a = a[np.isfinite(a)]
+        if a.size:
+            vals.append(a)
+    if not vals:
+        return 0.0, 1.0
+    allv = np.concatenate(vals)
+    return 0.0, max(float(np.percentile(allv, 99)), 1e-3)
+
+
+def _rain_panel(ax, glon, glat, field, title: str, vmin: float, vmax: float,
+                extent, view, fig, cmap: str = SPATIAL_CMAP_MEAN,
+                label: Optional[str] = None) -> None:
+    im = ax.pcolormesh(glon, glat, field, cmap=cmap, vmin=vmin, vmax=vmax,
+                       shading="auto")
+    _paper_axes(ax, title)
+    _mark_extent(ax, extent, label=label)
+    add_admin_layers(ax, view)
+    ax.set_xlim(view[0], view[1])
+    ax.set_ylim(view[2], view[3])
+    ax.set_aspect(_geo_aspect(view))
+    ax.set_xlabel("经度 (°E)", fontsize=9)
+    ax.set_ylabel("纬度 (°N)", fontsize=9)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02).ax.tick_params(labelsize=7)
+
+
 def render_precip_product(cfg: SearchConfig, win: Dict, glat: np.ndarray,
                           glon: np.ndarray, out_dir: str) -> Optional[str]:
-    """单个累计降水窗口的产品图：平均场、中位数场、各阈值概率场。"""
+    """单个累计降水窗口的主产品图：目标日、平均场、中位数场、阈值概率场。"""
     prod = win.get("products") or {}
     spatial = prod.get("spatial") or {}
     mean = spatial.get("mean")
     median = spatial.get("median")
     if mean is None:
         return None
+    target = spatial.get("target")
     ths = [float(t) for t in (win.get("thresholds") or []) if f"prob_{t}" in spatial]
-    panels = [("mean", None), ("median", None)] + [(f"prob_{t}", t) for t in ths]
+    panels = ([("target", None)] if target is not None else []) + \
+        [("mean", None), ("median", None)] + [(f"prob_{t}", t) for t in ths]
     n = len(panels)
     ncol = min(3, n)
     nrow = int(math.ceil(n / ncol))
@@ -612,15 +647,17 @@ def render_precip_product(cfg: SearchConfig, win: Dict, glat: np.ndarray,
     extent = _cell_extent(glon, glat)
     view = basemap_view(extent, 8.0)
     levels = np.linspace(0, 1, 11)
+    vmin, vmax = _shared_rain_scale([target, mean, median])
     label = win.get("label") or win.get("key", "")
     for i, (key, th) in enumerate(panels):
         ax = axes[i // ncol][i % ncol]
-        if key in ("mean", "median"):
-            field = mean if key == "mean" else median
-            im = ax.pcolormesh(glon, glat, field, cmap=SPATIAL_CMAP_MEAN,
-                               shading="auto")
-            title = f"相似日累计降水{'平均' if key == 'mean' else '中位数'} (mm)"
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02).ax.tick_params(labelsize=7)
+        if key in ("target", "mean", "median"):
+            field = {"target": target, "mean": mean, "median": median}[key]
+            title = ("目标日累计降水 (mm)\n" + str(cfg.target_date) if key == "target"
+                     else f"相似日累计降水{'平均' if key == 'mean' else '中位数'} (mm)")
+            _rain_panel(ax, glon, glat, field, f"{title}\n{label} · n={prod.get('n_valid', 0)}",
+                        vmin, vmax, extent, view, fig,
+                        label="检索数据区" if i == 0 else None)
         else:
             field_p = spatial.get(key)
             cmap_p = SPATIAL_CMAP_PROB_STRONG if th >= 30 else SPATIAL_CMAP_PROB_LOW
@@ -628,24 +665,73 @@ def render_precip_product(cfg: SearchConfig, win: Dict, glat: np.ndarray,
                                norm=BoundaryNorm(levels, 256))
             cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02, ticks=levels)
             cb.ax.set_yticklabels([f"{int(l * 100)}%" for l in levels], fontsize=7)
-            title = f"累计降水 ≥ {th:g}mm 概率"
-        _paper_axes(ax, f"{title}\n{label} · n={prod.get('n_valid', 0)}")
-        _mark_extent(ax, extent, label="检索数据区" if i == 0 else None)
-        add_admin_layers(ax, view)
-        ax.set_xlim(view[0], view[1])
-        ax.set_ylim(view[2], view[3])
-        ax.set_aspect(_geo_aspect(view))
-        ax.set_xlabel("经度 (°E)", fontsize=9)
-        ax.set_ylabel("纬度 (°N)", fontsize=9)
+            _paper_axes(ax, f"累计降水 ≥ {th:g}mm 概率\n{label} · n={prod.get('n_valid', 0)}")
+            _mark_extent(ax, extent)
+            add_admin_layers(ax, view)
+            ax.set_xlim(view[0], view[1])
+            ax.set_ylim(view[2], view[3])
+            ax.set_aspect(_geo_aspect(view))
+            ax.set_xlabel("经度 (°E)", fontsize=9)
+            ax.set_ylabel("纬度 (°N)", fontsize=9)
     for i in range(n, nrow * ncol):   # 多余面板隐藏
         axes[i // ncol][i % ncol].set_visible(False)
     fig.suptitle(f"GMCP 累计降水相似产品 · {cfg.name} · 目标 {cfg.target_date}",
                  fontsize=12, color=INK)
     fig.text(0.5, 0.005,
-             f"由 {prod.get('n_valid', 0)} 个相似历史日的累计降水场统计；"
+             f"首格为目标日实况，其余由 {prod.get('n_valid', 0)} 个相似历史日的累计降水场统计；"
              "窗口：" + label,
              ha="center", fontsize=8, color="#4A5058")
     return _save(fig, os.path.join(out_dir, f"precip_{win.get('key', 'window')}.png"))
+
+
+def render_precip_quantile(cfg: SearchConfig, win: Dict, glat: np.ndarray,
+                           glon: np.ndarray, out_dir: str,
+                           percentile: Optional[float] = None) -> Optional[str]:
+    """分位数产品图：目标日 + P10/P25/P50/P75/P90 + 用户自定义百分位。"""
+    prod = win.get("products") or {}
+    spatial = prod.get("spatial") or {}
+    med = spatial.get("median")
+    if med is None:
+        return None
+    target = spatial.get("target")
+    pc = float(percentile if percentile is not None
+               else win.get("percentile", DEFAULT_PERCENTILE))
+    panels = ([("target", "目标日")] if target is not None else []) + \
+        [(f"q{q}", f"P{q} 分位") for q in PRECIP_QUANTILES] + \
+        [("custom", f"自定义 P{pc:g} 分位")]
+    # P50 与中位数口径相同，此处保留以便分位数序列完整
+    fields = [target] + [spatial.get(f"q{q}") for q in PRECIP_QUANTILES] + \
+        [spatial.get("custom")]
+    vmin, vmax = _shared_rain_scale(fields)
+    n = len(panels)
+    ncol = min(3, n)
+    nrow = int(math.ceil(n / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(6.2 * ncol, 5.0 * nrow),
+                             squeeze=False)
+    fig.patch.set_facecolor(PAPER)
+    extent = _cell_extent(glon, glat)
+    view = basemap_view(extent, 8.0)
+    label = win.get("label") or win.get("key", "")
+    for i, (key, name) in enumerate(panels):
+        ax = axes[i // ncol][i % ncol]
+        field = target if key == "target" else spatial.get(key)
+        if field is None:
+            ax.set_visible(False)
+            continue
+        title = (f"{name} (mm)\n{cfg.target_date} · {label}" if key == "target"
+                 else f"{name} 累计降水 (mm)\n{label} · n={prod.get('n_valid', 0)}")
+        _rain_panel(ax, glon, glat, field, title, vmin, vmax, extent, view, fig,
+                    label="检索数据区" if i == 0 else None)
+    for i in range(n, nrow * ncol):
+        axes[i // ncol][i % ncol].set_visible(False)
+    fig.suptitle(f"GMCP 累计降水分位数产品 · {cfg.name} · 目标 {cfg.target_date}",
+                 fontsize=12, color=INK)
+    fig.text(0.5, 0.005,
+             f"同色标便于横向比较；由 {prod.get('n_valid', 0)} 个相似历史日的累计降水场"
+             f"统计，自定义百分位 P{pc:g}",
+             ha="center", fontsize=8, color="#4A5058")
+    return _save(fig, os.path.join(out_dir,
+                                   f"precip_quantile_{win.get('key', 'window')}.png"))
 
 
 def render_precip_all(cfg: SearchConfig, precip: Dict, glat: np.ndarray,
@@ -653,14 +739,18 @@ def render_precip_all(cfg: SearchConfig, precip: Dict, glat: np.ndarray,
                       progress=None) -> Dict[str, str]:
     windows = (precip or {}).get("windows") or {}
     out: Dict[str, str] = {}
-    total = len(windows)
+    total = len(windows) * 2
     for i, (key, win) in enumerate(windows.items(), 1):
         if progress:
-            progress("figures", "生成图表", i - 1, total, f"累计降水产品图 · {key}")
+            progress("figures", "生成图表", 2 * i - 2, total,
+                     f"累计降水产品图 · {key}")
         try:
             p = render_precip_product(cfg, win, glat, glon, out_dir)
             if p:
                 out[f"precip_{key}"] = p
+            q = render_precip_quantile(cfg, win, glat, glon, out_dir)
+            if q:
+                out[f"precip_quantile_{key}"] = q
         except Exception as exc:  # 单图失败不应中断整轮检索
             out[f"error_precip_{key}"] = f"{type(exc).__name__}: {exc}"
     if progress:
@@ -851,6 +941,26 @@ def _self_check() -> None:
                       tmp)
     assert "spatial_00utc" in figs and "spatial_06utc" in figs, figs
     assert "spatial_24h" not in figs
+    # ── V2.2.0：累计降水主产品图（含目标日）与分位数产品图 ──────────
+    win = {"key": "24h_2020", "label": "24h 测试窗口", "thresholds": [0.1, 50.0],
+           "percentile": 90.0, "target_field": field,
+           "products": {"n_valid": 4, "spatial": {
+               "target": field, "mean": field, "median": field,
+               "q10": field * 0.1, "q25": field * 0.25, "q50": field,
+               "q75": field * 0.75, "q90": field * 0.9, "custom": field * 0.9,
+               "prob_0.1": field, "prob_50.0": field * 0}}}
+    pp = render_precip_product(cfg, win, glat, glon, tmp)
+    pq = render_precip_quantile(cfg, win, glat, glon, tmp)
+    assert pp and pq and os.path.getsize(pp) > 0 and os.path.getsize(pq) > 0, (pp, pq)
+    # 自定义百分位变化必须改变输出文件（内容随参数重算）
+    pq2 = render_precip_quantile(cfg, win, glat, glon, tmp, percentile=60)
+    assert pq2 and os.path.getsize(pq2) > 0
+    assert os.path.basename(pq2).startswith("precip_quantile_")
+    # 多个窗口时每窗主图 + 分位数图各一张
+    p_all = render_precip_all(cfg, {"windows": {"24h_2020": win, "24h_0808": win}},
+                              glat, glon, tmp)
+    assert {"precip_24h_2020", "precip_quantile_24h_2020",
+            "precip_24h_0808", "precip_quantile_24h_0808"} <= set(p_all), p_all
     print("viz self-check OK")
 
 
